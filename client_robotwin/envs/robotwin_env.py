@@ -21,9 +21,11 @@ RoboTwin 侧 API（精读 `/home/xukainan/RoboTwin/envs/_base_task.py` + `script
 
 import importlib
 import logging
+import os
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
+import yaml
 
 
 class RoboTwinEnv:
@@ -59,6 +61,8 @@ class RoboTwinEnv:
         self._success_once = False
         self._instruction = ""
         self.env = self._make_env()
+        # 解析 RoboTwin setup_demo 所需的完整 args（yaml + 相机/embodiment 二次解析），缓存复用。
+        self._setup_kwargs = self._resolve_setup_kwargs()
 
     # ---- RoboTwin env 构造（等价 eval_policy.class_decorator）----
     def _make_env(self):
@@ -76,13 +80,75 @@ class RoboTwinEnv:
         env.exec_backend = self.exec_backend
         return env
 
+    # ---- 复刻 RoboTwin script/eval_policy.py 的 config 组装（加载 yaml + 解析相机/embodiment）----
+    def _resolve_setup_kwargs(self) -> Dict[str, Any]:
+        """把 robotwin_task_config 解析成可直接 `setup_demo(**kwargs)` 的完整 dict。
+
+        镜像 `script/eval_policy.py::main`(line 78-117) + `eval_policy()`(line 229 设 eval_mode=True)：
+          ① 按 `task_config` 名加载 RoboTwin `task_config/{name}.yml`；② 用户覆盖项盖其上；
+          ③ 由 camera type 解析 head_camera_h/w；④ 由 embodiment 解析 robot file + embodiment config。
+        相对路径假定 cwd=RoboTwin 根（run_robotwin_client 启动时已 `os.chdir(robotwin_root)`）。
+        """
+        cfg = dict(self.task_config)
+        yaml_stem = cfg.pop("task_config", None)
+        args: Dict[str, Any] = {}
+        if yaml_stem is not None:
+            with open(f"./task_config/{yaml_stem}.yml", "r", encoding="utf-8") as f:
+                args = yaml.load(f.read(), Loader=yaml.FullLoader)
+        args.update(cfg)                  # 用户覆盖项（eval_mode/render_freq/camera 等）盖在 yaml 之上
+        args["task_name"] = self.task_name
+
+        assert "camera" in args and "embodiment" in args, (
+            "robotwin_task_config 需提供 RoboTwin 场景配置：请设 `task_config`=task_config/ 下的 yaml 名"
+            "（如 'demo_clean'，含 camera/embodiment/data_type/domain_randomization）")
+
+        # 相机 h/w（eval_policy.py:100-102）
+        with open("./task_config/_camera_config.yml", "r", encoding="utf-8") as f:
+            cam_cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
+        head_type = args["camera"]["head_camera_type"]
+        args["head_camera_h"] = cam_cfg[head_type]["h"]
+        args["head_camera_w"] = cam_cfg[head_type]["w"]
+
+        # embodiment（eval_policy.py:85-117）：解析 robot file + 加载各自 config.yml
+        with open("./task_config/_embodiment_config.yml", "r", encoding="utf-8") as f:
+            emb_types = yaml.load(f.read(), Loader=yaml.FullLoader)
+
+        def _emb_file(t: str) -> str:
+            rf = emb_types[t]["file_path"]
+            if rf is None:
+                raise RuntimeError(f"embodiment {t} 缺 file_path")
+            return rf
+
+        def _emb_config(robot_file: str) -> dict:
+            with open(os.path.join(robot_file, "config.yml"), "r", encoding="utf-8") as f:
+                return yaml.load(f.read(), Loader=yaml.FullLoader)
+
+        emb = args["embodiment"]
+        if len(emb) == 1:                 # 单 embodiment（双臂同体，如 aloha-agilex）
+            args["left_robot_file"] = _emb_file(emb[0])
+            args["right_robot_file"] = _emb_file(emb[0])
+            args["dual_arm_embodied"] = True
+        elif len(emb) == 3:               # 左右异体 + 间距
+            args["left_robot_file"] = _emb_file(emb[0])
+            args["right_robot_file"] = _emb_file(emb[1])
+            args["embodiment_dis"] = emb[2]
+            args["dual_arm_embodied"] = False
+        else:
+            raise ValueError("embodiment items should be 1 or 3 (见 eval_policy.py:104-114)")
+        args["left_embodiment_config"] = _emb_config(args["left_robot_file"])
+        args["right_embodiment_config"] = _emb_config(args["right_robot_file"])
+
+        args.setdefault("eval_mode", True)  # 对齐 RoboTwin eval（eval_policy.py:229）；可在 config 覆盖为 False（seen 纹理）
+        return args
+
     # ---- 与 droid_env 同名接口 ----
     def reset(self) -> Dict[str, Any]:
         """新 episode：按递增 seed 布置场景，返回首帧 obs。"""
         seed = self._seed + self._ep_count
-        # is_test=True 走评测态（unseen 纹理等）；task_config 透传（render/camera/data_type 等）。
+        # 完全对齐 RoboTwin eval（script/eval_policy.py:237）：setup_demo(now_ep_num, seed,
+        # is_test=True, **解析后的 args)；args 已含 eval_mode / camera h-w / embodiment config 等。
         self.env.setup_demo(now_ep_num=self._ep_count, seed=seed,
-                            is_test=True, **self.task_config)
+                            is_test=True, **self._setup_kwargs)
         self._instruction = self._resolve_instruction()
         self.env.set_instruction(instruction=self._instruction)
         self._steps_since_reset = 0

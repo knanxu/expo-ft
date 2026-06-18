@@ -39,12 +39,14 @@ def get_config():
     config.n_real_dims = 14                   # 双臂 2×(6关节+1夹爪)
     config.max_decision_steps = 200           # 每 episode 最多 env-step（对齐 RLinf max_episode_steps）
     config.seed = 0
-    # RoboTwin 场景配置（透传给 setup_demo(**robotwin_task_config)）：相机/渲染/data_type 等。
-    # ⚠️ 必须启用 rgb(head/left/right_camera) + qpos，否则 get_obs 取不到图像/14 维 state。
-    # 建议直接加载 RoboTwin 的 task_config yaml（如 /home/xukainan/RoboTwin/task_config/<task>.yml）。
+    # RoboTwin 场景配置：只填要加载的 task_config yaml 名 + 少量覆盖项；camera/embodiment/
+    # data_type/domain_randomization 由适配器按 RoboTwin eval_policy.py 的方式从该 yaml **二次解析**
+    # （见 client_robotwin/envs/robotwin_env.py::_resolve_setup_kwargs），无需在此手写大段嵌套配置。
+    # demo_clean = 干净桌面、无杂物/无背景随机，data_type 含 rgb(head+wrist)+qpos，适合 RL bootstrap。
     config.robotwin_task_config = ml_collections.ConfigDict({
-        "data_type": {"rgb": True, "qpos": True, "endpose": False},
-        # TODO(用户): 按 RoboTwin task_config yaml 补全 camera / render_freq / domain_randomization 等。
+        "task_config": "demo_clean",   # 加载 <robotwin_root>/task_config/demo_clean.yml
+        "eval_mode": True,             # 对齐 RoboTwin eval（unseen 纹理），与步骤4 baseline 一致；换 seen 设 False
+        "render_freq": 0,              # headless 无屏渲染（与 demo_clean.yml 一致，显式保留）
     })
 
     return config
