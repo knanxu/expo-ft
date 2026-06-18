@@ -151,9 +151,21 @@ async def _handle_environment_request(websocket: _server.ServerConnection):
 async def _run_server(args: Args):
     global _config_task_path, _robotwin_root
     _config_task_path = args.config_task_path
-    _robotwin_root = args.robotwin_root
+    _robotwin_root = os.path.abspath(args.robotwin_root) if args.robotwin_root else None
+
+    # 先把 expo-ft 仓库根（含 configs/ 与 client_robotwin/）以**绝对路径**钉进 sys.path，
+    # 这样即便下面 chdir 到 RoboTwin，`import configs.task.X` / `client_robotwin.*` 仍可 import。
+    _expo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _expo_root not in sys.path:
+        sys.path.insert(0, _expo_root)
     if _robotwin_root and _robotwin_root not in sys.path:
         sys.path.insert(0, _robotwin_root)  # 使 RoboTwinEnv 内 `import envs.{task}` 可用
+    # RoboTwin 任务/资产代码大量用**相对 cwd**的路径：import 期就读（如
+    # envs/utils/rand_create_cluttered_actor.py 的 ./assets/objects/objaverse/list.json），
+    # 运行期 setup_demo/get_obs 加载 mesh 同理；RoboTwin 自家脚本均假定 cwd=仓库根。这里持久
+    # chdir 对齐，否则从 expo-ft 目录启动 server 会 FileNotFoundError。
+    if _robotwin_root:
+        os.chdir(_robotwin_root)
     logger = logging.getLogger(__name__)
     async with _server.serve(
         _handle_environment_request, args.server_host, args.server_port,

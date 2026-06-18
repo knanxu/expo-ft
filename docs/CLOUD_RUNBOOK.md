@@ -101,12 +101,16 @@ pip install -e <CLOUD>/expo-ft/expo_ft/agents/vla/openpi/packages/openpi-client
 ```
 **验证 gate 2b（RoboTwin + 适配器 import OK）**：
 ```bash
-cd <CLOUD>/expo-ft
-PYTHONPATH=<CLOUD>/RoboTwin python -c "
+# RoboTwin 在 import 期就用**相对路径**读 ./assets/objects/objaverse/list.json（任何 import envs.* 都触发，
+# 见排查表），故 gate 必须从 RoboTwin 根跑、expo-ft 放 PYTHONPATH。先确认该索引存在（不入 git，须由 assets 下载提供）：
+ls <CLOUD>/RoboTwin/assets/objects/objaverse/list.json
+cd <CLOUD>/RoboTwin
+PYTHONPATH=<CLOUD>/expo-ft python -c "
 import envs.stack_blocks_two as m; print('robotwin task OK:', hasattr(m,'stack_blocks_two'))
 from client_robotwin.envs.robotwin_env import RoboTwinEnv; print('adapter import OK')
 "
 ```
+（server 端不用手动 cd：`run_robotwin_client.py` 启动时已 `os.chdir(robotwin_root)` 并把 expo-ft 根钉进 sys.path。）
 （`envs.stack_blocks_two`：RoboTwin 里 stack-two-blocks 的任务模块，类名应=文件名；不一致就改 `configs/task/robotwin_stack_blocks.py` 的 `task_name`。）
 
 ---
@@ -213,6 +217,7 @@ wandb / 日志看：
 | 步骤3 checkpoint key/shape mismatch | config 的 pi0.5 结构与 checkpoint 不符（variant/action_dim/horizon/LoRA） |
 | 步骤5 `flat_item['action']` KeyError | repack 需 `action`——SEAM-2 preprocess 已补 dummy；若仍报，确认走的是 `train_pi_robo_dbpo_async` 的 preprocess（非 RoboTwin deploy 路径） |
 | obs transform 报相机/键错 | `robotwin_task_config` 未启用对应相机 / RoboTwin get_obs 相机名≠head/left/right_camera |
+| `assets/objects/objaverse/list.json` FileNotFoundError（import envs 或起 server 时） | ① **cwd 不对**：RoboTwin import 期用相对路径读 assets——gate 2b 从 RoboTwin 根跑；server 端 `run_robotwin_client` 已 `os.chdir(robotwin_root)` 兜底。② **文件真缺**：该索引不入 git，须由 RoboTwin assets 下载提供（仅 import 需 list.json 这 22KB 索引；stack_blocks_two 运行期不加载 objaverse mesh） |
 | ratio 首更新 ≠1（>1.01） | matmul 精度（脚本已设 highest）/ z 未正确复用 / logp_old 未在采集时存 |
 | success 一直 0 | 回步骤4：DBP baseline 本就做不动；或 H_e/control_hz 与训练不一致致分布漂移 |
 
