@@ -255,7 +255,8 @@ def main(_):
                      if np.isscalar(v) or (hasattr(v, "ndim") and v.ndim == 0)}
             log_d["training/per_beta"] = beta
             log_d["training/n_updates"] = _n_updates[0]
-            wandb.log(log_d, step=_step[0])
+            log_d["decision_step"] = _step[0]   # 作图 x 轴（多线程不传 wandb step，避免非单调丢点）
+            wandb.log(log_d)
             if FLAGS.checkpoint_model and FLAGS.checkpoint_interval > 0 \
                     and _n_updates[0] % FLAGS.checkpoint_interval == 0:
                 _save_checkpoint(log_dir, learner_lr, _n_updates[0])
@@ -302,7 +303,7 @@ def main(_):
             real_chunk = unnormalize(mean, obs_m)                    # [H, n_real]
 
             idxs, actor_lr = actor_lr.sample_action_idxs(feat[None])
-            idxs = np.asarray(idxs[0])
+            idxs = np.asarray(idxs[0], dtype=np.int32)
             speed_params, v_list = backend.decode(idxs)
 
             _executed, exec_info = env.step_chunk(real_chunk, speed_params, exec_backend)
@@ -321,7 +322,8 @@ def main(_):
                 sp_log = {f"action/{k}": float(val) for k, val in speed_params.items()}
                 sp_log["exec/dense_steps"] = int(exec_info.get("n_exec_steps", 0))
                 sp_log["exec/duration_s"] = float(exec_info.get("duration", 0.0))
-                wandb.log(sp_log, step=it)
+                sp_log["decision_step"] = it
+                wandb.log(sp_log)
 
             obs = env.reset() if done else env.get_observation()
             if done:
@@ -334,7 +336,8 @@ def main(_):
                                "rollout/dense_steps": float(np.mean(ep_dense[-50:])),
                                "rollout/fallback_rate": float(fb_rate),
                                "rollout/epsilon": _epsilon_at(it, config),
-                               "rollout/buffer_size": len(buffer)}, step=it)
+                               "rollout/buffer_size": len(buffer),
+                               "decision_step": it})
     finally:
         _flush_episode()
         _stop.set()
@@ -345,7 +348,7 @@ def main(_):
 def _save_checkpoint(log_dir, learner, step):
     try:
         import orbax.checkpoint as ocp
-        ckpt_dir = epath.Path(log_dir) / "checkpoints" / f"update_{step}"
+        ckpt_dir = epath.Path(log_dir).resolve() / "checkpoints" / f"update_{step}"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         with ocp.StandardCheckpointer() as ckptr:
             ckptr.save(ckpt_dir / "q_net", learner.q_net.params)

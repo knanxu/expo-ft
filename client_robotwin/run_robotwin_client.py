@@ -198,6 +198,21 @@ async def _run_server(args: Args):
     if _robotwin_root:
         os.chdir(_robotwin_root)
     logger = logging.getLogger(__name__)
+    # 对齐 RoboTwin 所有入口（eval_policy/eval_policy_client/collect_data 跑前都先 Sapien_TEST）：
+    # 在干净状态下做一次 sapien 光追渲染自检/预热（shader/oidn denoiser/GPU context）。缺这步，
+    # 首个 episode 的 setup_scene 创建渲染 buffer 可能失败（"cannot create buffer"）。
+    if _robotwin_root:
+        _script_dir = os.path.join(_robotwin_root, "script")
+        if _script_dir not in sys.path:
+            sys.path.insert(0, _script_dir)
+        try:
+            from test_render import Sapien_TEST
+            Sapien_TEST()   # 渲染 OK → 打印 "Render Well"；坏 → "Render Error" 并 exit()
+        except SystemExit:
+            logger.error("Sapien 渲染自检失败（Render Error）：检查 GPU 可见性/显存/sapien 安装。")
+            raise
+        except Exception as e:
+            logger.warning("Sapien_TEST 跳过（import 失败，继续；reset 可能 cannot create buffer）：%s", e)
     async with _server.serve(
         _handle_environment_request, args.server_host, args.server_port,
         compression=None, max_size=None,
