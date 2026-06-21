@@ -60,9 +60,18 @@ class RoboTwinEnv:
         self._steps_since_reset = 0
         self._success_once = False
         self._instruction = ""
+        # episode 提示词回退：优先 config.language_instruction（经 config-as-kwargs 传入），
+        # 否则任务名（RoboTwin get_instruction 在无 play_once 时返回 None）。
+        self._lang_fallback = kwargs.get("language_instruction") or task_name.replace("_", " ")
         self.env = self._make_env()
         # 解析 RoboTwin setup_demo 所需的完整 args（yaml + 相机/embodiment 二次解析），缓存复用。
         self._setup_kwargs = self._resolve_setup_kwargs()
+        # episode 预算：默认用 RoboTwin 自己的 step_lim（首个 reset 后从 env 读到，见 reset）；
+        # 在那之前用 max_decision_steps 兜底。
+        self._step_budget = int(self.max_decision_steps)
+        # sapien 资源释放周期（对齐 RoboTwin eval 的 clear_cache_freq，demo_clean.yml=5）。
+        self._clear_cache_freq = int(self._setup_kwargs.get("clear_cache_freq", 5) or 5)
+        self._max_reset_retries = 20        # setup_demo 不稳定 seed 的最大换 seed 次数
 
     # ---- RoboTwin env 构造（等价 eval_policy.class_decorator）----
     def _make_env(self):
@@ -143,12 +152,55 @@ class RoboTwinEnv:
 
     # ---- 与 droid_env 同名接口 ----
     def reset(self) -> Dict[str, Any]:
-        """新 episode：按递增 seed 布置场景，返回首帧 obs。"""
-        seed = self._seed + self._ep_count
-        # 完全对齐 RoboTwin eval（script/eval_policy.py:237）：setup_demo(now_ep_num, seed,
-        # is_test=True, **解析后的 args)；args 已含 eval_mode / camera h-w / embodiment config 等。
-        self.env.setup_demo(now_ep_num=self._ep_count, seed=seed,
-                            is_test=True, **self._setup_kwargs)
+        """新 episode：按递增 seed 布置场景，返回首帧 obs。
+
+        对齐 RoboTwin eval（script/eval_policy.py:396-434）：
+          ① 每个新 episode **前**先 `close_env`（周期性 clear_cache，防 sapien 资源/显存累积——
+             RoboTwin 的 setup_scene 每次新建 engine/renderer/scene，不释放会漏）；
+          ② setup_demo 可能因布局不稳定抛 `UnStableError`（或其它异常）——像 eval_policy 那样
+             换下一个 seed 重试，而不是让整轮 rollout 崩。
+        """
+        try:
+            from envs.utils.create_actor import UnStableError  # RoboTwin venv 内可用
+        except Exception:
+            UnStableError = ()  # 退化：仅靠下面的通用 Exception 兜底
+
+        # episode 间释放上一幕（首个 episode 无上一幕）。close_env 内部 self.close() 为 no-op，
+        # 真正作用是 clear_cache=True 时的 sapien_clear_cache（对齐 eval_policy 的 clear_cache_freq）。
+        if self._ep_count > 0:
+            try:
+                self.env.close_env(clear_cache=(self._ep_count % self._clear_cache_freq == 0))
+            except Exception:
+                logging.exception("[RoboTwin] close_env between episodes failed")
+
+        last_err = None
+        for _ in range(self._max_reset_retries):
+            seed = self._seed + self._ep_count
+            try:
+                # 完全对齐 RoboTwin eval（script/eval_policy.py:434）：setup_demo(now_ep_num, seed,
+                # is_test=True, **解析后的 args)；args 已含 eval_mode / camera h-w / embodiment config 等。
+                self.env.setup_demo(now_ep_num=self._ep_count, seed=seed,
+                                    is_test=True, **self._setup_kwargs)
+                break
+            except UnStableError as e:           # 该 seed 布局不稳 → 换下一个 seed
+                last_err = e
+                logging.warning("[RoboTwin] UnStableError at seed=%d; trying next seed.", seed)
+            except Exception as e:               # 其它 setup 失败同样换 seed 重试（对齐 eval_policy）
+                last_err = e
+                logging.warning("[RoboTwin] setup_demo failed at seed=%d (%s); trying next seed.", seed, e)
+            try:
+                self.env.close_env(clear_cache=False)
+            except Exception:
+                pass
+            self._ep_count += 1
+        else:
+            raise RuntimeError(
+                f"[RoboTwin] setup_demo failed after {self._max_reset_retries} seeds") from last_err
+
+        # episode 预算 = RoboTwin 自己的 step_lim（eval_mode 下由 _eval_step_limit.yml 决定，
+        # 如 stack_blocks_two=800 个 take_action）；缺失（eval_mode=False）才回退 max_decision_steps。
+        self._step_budget = int(getattr(self.env, "step_lim", None) or self.max_decision_steps)
+
         self._instruction = self._resolve_instruction()
         self.env.set_instruction(instruction=self._instruction)
         self._steps_since_reset = 0
@@ -196,7 +248,9 @@ class RoboTwinEnv:
         """评测终止：(done, success, reward, mask)。稀疏 0/1 终局，无 shaping。"""
         success = bool(self.env.check_success())
         self._success_once = self._success_once or success
-        time_up = self._steps_since_reset >= self.max_decision_steps
+        # 用 RoboTwin 自己的 step_lim 作 episode 预算（reset 时读到），而非过小的固定 200——
+        # 否则 stack_blocks_two（step_lim=800）会在 ~1/4 预算处被截断，任务做不完→success 恒 0→无 RL 信号。
+        time_up = self._steps_since_reset >= self._step_budget
         done = bool(self._success_once or time_up)
         reward = 1.0 if success else 0.0     # 稀疏：仅成功步给 1（macro 聚合在 learner）
         mask = 0.0 if done else 1.0
@@ -222,7 +276,7 @@ class RoboTwinEnv:
                 return instr
         except Exception:
             pass
-        return self.task_name.replace("_", " ")
+        return self._lang_fallback
 
     def close(self):
         try:

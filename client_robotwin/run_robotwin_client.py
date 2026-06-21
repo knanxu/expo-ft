@@ -179,7 +179,10 @@ async def _run_server(args: Args):
 def main(args: Args) -> None:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    logging.getLogger("websockets.server").setLevel(logging.WARNING)
+    # 抑制握手期噪声：云平台的本地端口探活/代理会每隔几秒裸 TCP 连 8102 后立即断开
+    # （0 字节 → websockets 在 ERROR 级打 "opening handshake failed" + EOFError 栈），与功能无关。
+    # 提到 CRITICAL 把这类握手前失败静默掉；真实请求处理中的错误仍由本模块 handler 自行 log.error。
+    logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
     asyncio.run(_run_server(args))
 
 
