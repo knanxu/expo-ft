@@ -390,6 +390,13 @@ class Pi05Agent(Model):
         """Convert raw env observations into a batched model-ready Observation dict."""
         # create a dummy actions
         raw_observations["actions"] = np.zeros(action_dim)
+        # Aloha/LeRobot-style configs (e.g. RoboTwin `pi05_aloha_robotwin_*`) repack the action
+        # from the SINGULAR key "action" with shape (action_horizon, action_dim); AlohaInputs then
+        # indexes it 2-D (`actions[:, [6, 13]]`), so the 1-D "actions" dummy above is insufficient.
+        # Add a 2-D "action" dummy (dropped after Observation.from_dict, so its value is irrelevant —
+        # only the shape must flow through the transforms). DROID repacks "actions" and ignores this
+        # extra key, so existing DROID/EXPO behavior is unchanged (zero-intrusion, additive only).
+        raw_observations["action"] = np.zeros((self.model_config.action_horizon, action_dim))
         for key, value in raw_observations.items():
             raw_observations[key] = np.asarray(value)
             if "image" in key:

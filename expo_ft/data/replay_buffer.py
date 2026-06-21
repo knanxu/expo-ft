@@ -226,6 +226,12 @@ class PiReplayBuffer(Dataset):
     
         obs_data_dict = data_dict["observations"].copy()
         obs_data_dict["actions"] = action_chunk_raw
+        # Aloha/LeRobot-style configs (e.g. RoboTwin `pi05_aloha_robotwin_*`) repack the action
+        # chunk from the SINGULAR key "action" (`{"actions": "action"}`), whereas DROID repacks
+        # the plural "actions". Provide both so the RepackTransform finds its source key regardless
+        # of config: DROID's repack reads "actions" and harmlessly ignores this extra "action"
+        # entry, so existing DROID/EXPO behavior is unchanged (zero-intrusion, additive only).
+        obs_data_dict["action"] = action_chunk_raw
         obs_data_dict["rewards"] = np.asarray(data_dict["rewards"])
         obs_data_dict["masks"] = np.asarray(data_dict["masks"])
         obs_data_dict["dones"] = np.asarray(data_dict["dones"])
