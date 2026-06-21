@@ -33,7 +33,6 @@ import wandb
 
 import openpi.training.sharding as openpi_sharding
 from expo_ft.env.env_client import EnvClientWrapper
-from expo_ft.env.droid_utils import process_droid_dataset
 from expo_ft.utils.train_utils import init_logging, init_wandb
 
 from expo_ft.agents.alg.speedtune_dqn import SpeedTuneLearner
@@ -183,8 +182,11 @@ def main(_):
     init_wandb(epath.Path(log_dir), FLAGS.resume, FLAGS.project_name, FLAGS.run_name)
     wandb.config.update(FLAGS.flag_values_dict(), allow_val_change=FLAGS.resume)
 
-    dataset = process_droid_dataset(FLAGS.dataset_path, config_task, num_data=0)
-    example_action = dataset[0]["actions"][np.newaxis]
+    # SpeedTune 是在线 RL，无需离线数据集；example_action 仅作 env_creation_request 占位
+    # （RoboTwin create_env 不消费它，动作空间由 n_real_dims 决定）。
+    example_action = np.asarray(
+        config_task.get("example_action", np.zeros((1, int(config.n_real_dims)), dtype=np.float32)),
+        dtype=np.float32)
 
     logging.info("Creating RoboTwin training env via env_client ...")
     env = EnvClientWrapper(
