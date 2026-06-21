@@ -20,6 +20,7 @@ RoboTwin 侧 API（精读 `/home/xukainan/RoboTwin/envs/_base_task.py` + `script
 """
 
 import importlib
+import inspect
 import logging
 import os
 from typing import Any, Dict, Optional, Tuple
@@ -264,6 +265,20 @@ class RoboTwinEnv:
         "chunk_toppra": "whole_chunk",      # 整段 TOPPRA（take_chunk_action）
     }
 
+    @staticmethod
+    def _call_backend(fn, chunk, **kwargs):
+        """只传 fn 实际接受的 kwargs，适配不同 RoboTwin 版本的后端签名。
+
+        不同 RoboTwin 分支的 take_chunk_action_* 签名可能不同（例如有/无 ``max_actions``、
+        ``video_save_freq``）。按 fn 的真实签名过滤，避免 ``unexpected keyword argument``；
+        若 fn 接受 ``**kwargs``（VAR_KEYWORD）则原样全传。
+        """
+        params = inspect.signature(fn).parameters
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return fn(chunk, **kwargs)
+        accepted = {k: val for k, val in kwargs.items() if k in params}
+        return fn(chunk, **accepted)
+
     def step_chunk(self, chunk, speed_params=None, exec_backend=None) -> Dict[str, Any]:
         """整段执行一个 action chunk + 速度控制参数（SpeedTune 决策粒度）。
 
@@ -292,16 +307,17 @@ class RoboTwinEnv:
         vsf = -1  # train 不实时录视频（eval 另设）
 
         if rt == "streaming":
-            info = self.env.take_chunk_action_streaming(
-                chunk, v=v, hold_steps=self._stream_hold_steps,
-                max_actions=self._k_skip, video_save_freq=vsf)
+            info = self._call_backend(self.env.take_chunk_action_streaming, chunk,
+                                      v=v, hold_steps=self._stream_hold_steps,
+                                      max_actions=self._k_skip, video_save_freq=vsf)
         elif rt == "per_action":
-            info = self.env.take_chunk_action_per_action(
-                chunk, vel_scale=vel_scale, acc_scale=acc_scale, v=v,
-                max_actions=self._k_skip, video_save_freq=vsf)
+            info = self._call_backend(self.env.take_chunk_action_per_action, chunk,
+                                      vel_scale=vel_scale, acc_scale=acc_scale, v=v,
+                                      max_actions=self._k_skip, video_save_freq=vsf)
         else:  # whole_chunk：整段 TOPPRA，k_skip 不适用
-            info = self.env.take_chunk_action(
-                chunk, vel_scale=vel_scale, acc_scale=acc_scale, v=v, video_save_freq=vsf)
+            info = self._call_backend(self.env.take_chunk_action, chunk,
+                                      vel_scale=vel_scale, acc_scale=acc_scale, v=v,
+                                      video_save_freq=vsf)
         info = info or {}
         # episode 预算按消耗的 action 数累加（与 RoboTwin step_lim 同语义；后端内部也自查 step_lim）。
         self._steps_since_reset += int(info.get("take_action_cnt_delta", 0) or 0)
