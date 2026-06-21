@@ -292,6 +292,7 @@ uv run python train_pi_robo_async.py \
     --num_data 20 \
     --batch_size 64 --utd_ratio 20 \
     --max_steps 2000 \
+    --overwrite \
     --fsdp_devices 1   # 4 卡 RTX 5880：device0 采样 + device1-3 更新（3 路数据并行）；显存紧可改 3（模型分片）
 ```
 关键 flag（与 DBPO 不同点）：
@@ -303,6 +304,8 @@ uv run python train_pi_robo_async.py \
 - **`--max_steps`**（不是 DBPO 的 `--max_iters`）：env-step 总数（per-action 计）。冒烟 2000 足够看到首批 update。
 - **`--replan_steps 8`**：EXPO 执行前 8 个 action 再 replan（drift 仍预测整段 H=50）。Q/residual 维度 = 8×14=112（可控）。
 - `--offline_ratio 0.0`（默认）：demo 进在线 buffer；`--checkpoint_model` + `--checkpoint_interval N` 按需存盘。
+- **`--overwrite`（重跑/首跑都建议加）**：脚本在 checkpoint 守卫前已 `mkdir logs/<run_name>/checkpoints`，
+  故该目录一存在（含首跑）就 `raise FileExistsError`。`--overwrite` 清空重来；续训用 `--resume`。
 
 **验证 gate 6-EXPO（数据管线 + 首批 update 不崩）**：日志依次应见
 1. `Found <N> RoboTwin episodes; using <k>`（loader 找到 demo）；**不报** `flat_item['action']` KeyError
@@ -325,6 +328,7 @@ uv run python train_pi_robo_dbpo_async.py \
     --client_host localhost --client_port 8102 \
     --dataset_path "<可空或一条 demo 用于 example_action 形状>" \
     --run_name dbpo_stack_blocks_smoke --max_iters 50 \
+    --overwrite \
     --fsdp_devices 1
 ```
 （DBPO 的 `--dataset_path` 仅用于取 `example_action` 形状建 env；若没有可用 demo，可临时改脚本用 `np.zeros((1,50,14))` 占位。）
@@ -356,6 +360,7 @@ wandb / 日志看：
 |---|---|
 | 步骤1 import openpi 无 `use_drifting_loss` | 装成了非合并版 openpi；确认 editable 指向 `expo_ft/agents/vla/openpi`@`expo_ft_drift` |
 | 步骤3 checkpoint key/shape mismatch | config 的 pi0.5 结构与 checkpoint 不符（variant/action_dim/horizon/LoRA） |
+| 步骤6 `FileExistsError: Checkpoint directory ... already exists` | 脚本守卫前已 mkdir `logs/<run_name>/checkpoints`，故首跑/重跑都会撞。加 `--overwrite`（清空重来）或 `--resume`（续训） |
 | 步骤6 `flat_item['action']` KeyError | aloha/robotwin repack 读单数 `action`，而 EXPO 数据管线给的是复数 `actions`。**已修**：`replay_buffer.py::insert`（离线/在线 transition）与 `pi05.py::process_raw_inputs`（在线采样）各补一个 `action` 别名（DROID repack 读 `actions`、忽略此键，行为不变）。若仍报 → 云端未 `git pull` 到该 commit |
 | 步骤6-EXPO `At least 2 GPUs required` | async 双线程要 ≥2 GPU；`CUDA_VISIBLE_DEVICES` 至少暴露 2 张，且 `--fsdp_devices` 整除「GPU 数−1」 |
 | 步骤6-EXPO loader `No RoboTwin episode*.hdf5 found` | `--dataset_path` 没指到含 `episode{N}.hdf5` 的目录（指 `collect_data.py` 原始 demo 目录，非 LeRobot 转换目录） |
