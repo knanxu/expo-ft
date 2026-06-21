@@ -140,9 +140,10 @@ from client_robotwin.envs.robotwin_env import RoboTwinEnv; print('adapter import
 🔴 **两项必填**，否则 learner 起不来：
 - `config.pi05_weight_loader_path = "<你训好的 stack_blocks_two drift checkpoint 目录>"`（orbax params dir）。
   留空则 actor 从 base flow 权重初始化、drift 单步生成无效（greedy baseline 必然 0）。
-- `config.pi05_assets_dir` + `config.pi05_asset_id`：指向你 **DBP 训练算出的 norm_stats**（`assets_dir/asset_id/norm_stats.json`）。
-  ⚠️ **EXPO 的 replay buffer `_build_transform_pipeline` 强制要 norm_stats**（`replay_buffer.py:274` 缺则直接 `raise ValueError`），
-  这与 DBPO 不同——**不能留空**。留空会落到 openpi 默认 trossen assets（DROID 统计），与 RoboTwin 14-D 关节空间不符。
+- `config.pi05_assets_dir` + `config.pi05_asset_id`：指向你 **DBP 训练算出的 norm_stats**（`assets_dir/asset_id/norm_stats.json`），
+  即 **eval 用的同一份**——RoboTwin eval `create_trained_policy` 从 `<ckpt>/assets/<asset_id>` 加载（`asset_id`=`<ckpt>/assets/` 下的子目录名，如 `trossen`）。
+  ⚠️ **不能留空**：留空**不会报错**，而是**静默**落到 openpi 默认远程 `gs://.../pi05_base/assets/trossen`（通用 base-aloha 统计，**非**你 RoboTwin 训练统计）→ state 归一化 + action 反归一化全错 → rollout 0%（这是个隐蔽坑）。
+  填法：`pi05_assets_dir="<ckpt>/assets"`、`pi05_asset_id="<子目录名>"`（与步骤4 eval 的 `<ckpt>/assets/` 同源）。
 - 其余已对齐 EXPO（`model_cls=EXPOLearner` / `pi05_config_name=pi05_aloha_robotwin_drifting_stack_blocks_two` /
   `residual_action_xyzg=False` / `freeze_pi05_encoder=True` / `actor_success_only=True` / `num_qs=10` / `N=8`）。
   norm_stats 通常就在 `pi05_weight_loader_path` 同级的 `assets/` 里——优先指那里，与 greedy baseline 同源。
@@ -371,7 +372,7 @@ wandb / 日志看：
 | 步骤6-EXPO loader `No RoboTwin episode*.hdf5 found` | `--dataset_path` 没指到含 `episode{N}.hdf5` 的目录（指 `collect_data.py` 原始 demo 目录，非 LeRobot 转换目录） |
 | 步骤6-EXPO loader KeyError `left_camera`/`right_camera` | demo 采集时未存三相机 rgb；`process_robotwin_dataset._CAM_MAP` 要 head+left+right。换三相机齐全的 demo（与 demo_clean 同 data_type） |
 | 步骤6-EXPO `Normalization stats not found ... raise ValueError` | EXPO replay buffer 强制要 norm_stats；`expo_ft_pi_drift_config.py` 的 `pi05_assets_dir/pi05_asset_id` 必填，指 DBP norm_stats（见步骤 3-EXPO） |
-| 步骤6-EXPO rollout 成功率 0（但步骤4 greedy baseline 正常） | 多半 **language instruction 不符**：策略训练/eval 用的是**每集随机模板指令**（如 "Place red block and green block centrally, then stack green block on red block."），EXPO 旧版用固定 "stack the two blocks"。已按 RLinf 修（`RoboTwinEnv` 每集生成 + repack 保留 prompt + loader 读真实指令）。确认 `config_task.instruction_type` 与 gate-4 eval 的 `--instruction_type` **一致**；env 启动日志应见 `cached episode_info for instructions: {...}`（没有则 play_once 失败→走 fallback，查 curobo/seed） |
+| 步骤6-EXPO rollout 成功率 0（但步骤4 greedy baseline 正常） | 三个独立元凶，逐一排查（同 ckpt eval 50-60% 却 rollout 0）：**①norm_stats 用错**——`expo_ft_pi_drift_config.py` 的 `pi05_assets_dir/pi05_asset_id` 留空会用远程 base `pi05_base/assets/trossen`（通用统计），必须指 checkpoint 自带的那份（= eval `create_trained_policy` 用的 `<ckpt>/assets/<asset_id>`，见步骤 3-EXPO）。**②delta 动作未加当前位姿**——aloha config `use_delta_joint_actions=True`，策略输出 delta，须 `+当前 state` 才是绝对 qpos；旧 `process_transformed_outputs` 用 dummy zeros → 跳到平均位姿。**已修**（pi05.py 传归一化 state），云端需 `git pull`。**③language instruction 不符**——已按 RLinf 修；确认 `config_task.instruction_type` 与 gate-4 `--instruction_type` 一致，env 启动应见 `cached episode_info for instructions: {...}`。自检：dump `raw_actions[0]` 应在当前 qpos 附近的小幅运动，而非平均位姿 |
 | obs transform 报相机/键错 | `robotwin_task_config` 未启用对应相机 / RoboTwin get_obs 相机名≠head/left/right_camera |
 | `assets/objects/objaverse/list.json` FileNotFoundError（import envs 或起 server 时） | ① **cwd 不对**：RoboTwin import 期用相对路径读 assets——gate 2b 从 RoboTwin 根跑；server 端 `run_robotwin_client` 已 `os.chdir(robotwin_root)` 兜底。② **文件真缺**：该索引不入 git，须由 RoboTwin assets 下载提供（仅 import 需 list.json 这 22KB 索引；stack_blocks_two 运行期不加载 objaverse mesh） |
 | ratio 首更新 ≠1（>1.01） | matmul 精度（脚本已设 highest）/ z 未正确复用 / logp_old 未在采集时存 |

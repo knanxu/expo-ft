@@ -413,13 +413,29 @@ class Pi05Agent(Model):
         processed_inputs = _model.Observation.from_dict(transformed_inputs).to_dict()
         return processed_inputs
 
-    def process_transformed_outputs(self, transformed_actions, unnormalize=True):
-        """Unnormalize unpadded actions back to the environment action space."""
+    def process_transformed_outputs(self, transformed_actions, state=None, unnormalize=True):
+        """Unnormalize unpadded actions back to the environment action space.
+
+        ⚠️ Aloha/RoboTwin configs use **delta joint actions** (`use_delta_joint_actions=True`), so the
+        output transform chain ends with `AbsoluteActions`: `actions[:, :dims] += state[:, :dims]`
+        (12 arm-joint dims). `state` here MUST be the **normalized current state** — exactly what
+        openpi `Policy.infer` uses (`outputs["state"] = inputs["state"]`, policy.py:104). With the old
+        `dummy_state=zeros`, Unnormalize turns zeros into the dataset-mean pose, so delta actions get
+        added to the *mean* pose instead of the robot's *current* pose → absolute qpos targets ignore
+        where the arm actually is → task makes zero progress → 0% success.
+        Callers pass `transformed_inputs["state"]`. `state=None` keeps the dummy-zeros behavior for
+        configs whose output chain has no AbsoluteActions (e.g. DROID), where state is unused.
+        """
         n = transformed_actions.shape[0]
         padded = self._pad_actions(transformed_actions.reshape(n, -1))
-        dummy_state = np.zeros((n, self.model_config.action_dim), dtype=np.float32)
+        if state is None:
+            state_arr = np.zeros((n, self.model_config.action_dim), dtype=np.float32)
+        else:
+            state_arr = np.asarray(state, dtype=np.float32).reshape(-1, self.model_config.action_dim)
+            if state_arr.shape[0] != n:
+                state_arr = np.repeat(state_arr[:1], n, axis=0)
         output_dict = {
-            "state": dummy_state,
+            "state": state_arr,
             "actions": np.array(padded),
         }
         processed = [

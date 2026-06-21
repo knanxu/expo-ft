@@ -191,7 +191,8 @@ class BCLearner(AgentLearner, struct.PyTreeNode):
             train=False,
             num_samples=1,
         )
-        raw_actions = self.actor.process_transformed_outputs(transformed_actions)
+        # 传归一化当前 state：delta 动作经输出链 AbsoluteActions 加回当前位姿（见 process_transformed_outputs）。
+        raw_actions = self.actor.process_transformed_outputs(transformed_actions, state=transformed_inputs["state"])
         action = raw_actions[0]
         sample_info = {"sample_time": sample_time, "selected_action_type": "main"}
         return jnp.array(action), self.replace(rng=rng), sample_info

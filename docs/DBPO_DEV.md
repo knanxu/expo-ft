@@ -409,6 +409,29 @@ git merge improved/feat/jax-return-hidden
 
 > 倒序追加，每条：日期 · 阶段 · 改动 · 涉及文件 · 验证结果 · 下一步。
 
+### 2026-06-21 · Phase 4-EXPO · 修复 rollout 0% 的真正元凶：delta 动作 dummy_state + norm_stats 用错
+> 修完指令后 rollout 仍 0%（base-only + replan50）。逐行对比 eval（`pi_model.py` `create_trained_policy`/`get_action`
+> + `deploy_policy.py::eval`）后确认 obs/相机/执行**等价**，揪出两个**独立致命**的 bug——均属「DROID 上正确、换 aloha delta 动作空间静默失效」。
+- **🥇 Bug 1（致命）：`process_transformed_outputs` 用 `dummy_state=zeros` 反算 delta 动作**。
+  - robotwin/aloha config `use_delta_joint_actions=True`（`openpi/.../config.py:234` 默认）→ 输出链含
+    `AbsoluteActions(make_bool_mask(6,-1,6,-1))`（`transforms.py:234`：`actions[:,:dims] += state[:,:dims]`，12 个手臂关节维）。
+    即策略输出 **delta 关节**，需 `+ 当前 state` 才是绝对 qpos（env 以 `take_action(qpos)` 下发绝对目标）。
+  - 旧 `pi05.py:410` 传 `dummy_state=zeros` → `Unnormalize` 把 0 变成 **state_mean（数据集平均位姿）** → 动作 = delta + 平均位姿，
+    **与机器人当前位姿无关** → 机械臂每次 replan 朝平均姿势跑、任务零进展 → 0%。正确做法见 eval 的 `policy.py:104` `outputs["state"]=inputs["state"]`（真实归一化 state）。
+  - **DROID 不触发**：DROID 仅 `action_space==JOINT_POSITION` 才加 AbsoluteActions，默认输出链无此步，dummy zeros 无害。
+  - **修复**：`process_transformed_outputs` 加 `state` 参数，三处调用（`expo_ft.py:532/573`、`bc.py:194`）传 `transformed_inputs["state"]`
+    （归一化当前 state，n 维 broadcast）。`state=None` 保留 DROID 旧行为（其 `DroidOutputs` 只读 actions、忽略 state → 行为不变）。
+- **🥈 Bug 2（独立致命）：norm_stats 用错**。`expo_ft_pi_drift_config.py:68-69` 的 `pi05_assets_dir/asset_id` 留空 →
+  `build_pi05_config` 落到 config 默认远程 `gs://.../pi05_base/assets/trossen`（**通用 base aloha 统计**），而非 checkpoint 自带的
+  RoboTwin 统计。对照 eval：`pi_model.py:34-43` `assets_id=os.listdir("<ckpt>/assets/")[0]` + `create_trained_policy(robotwin_repo_id=assets_id)`
+  从 `<ckpt>/assets/<asset_id>` 加载训练时算的统计。统计不符 → state 归一化 + action 反归一化全错 → 0%。
+  **修复（用户填 config）**：`pi05_assets_dir="<ckpt>/assets"`、`pi05_asset_id="<那个子目录名，如 trossen>"`（= eval 用的同一份）。
+- **排除项**：drift `noise_samples=N=8` + `freeze_pi05_encoder=True` 采样路径**正确**（`raw_actions[0]` 是有效单样本，`N=1` 即等价 eval 单样本）；
+  repack/transform 等价；图像 RGB/CHW/相机映射、per-action qpos 执行均一致——都不是 0% 原因。
+- **涉及文件**：`expo_ft/agents/vla/pi05.py`、`expo_ft/agents/alg/expo_ft.py`、`expo_ft/agents/alg/bc.py`（Bug 1）；`configs/model/expo_ft_pi_drift_config.py`（Bug 2 用户填）。
+- **验证**：3 文件语法 OK；DBPO 12 测试回归。**待云端**：① 填对 norm_stats；② pull Bug 1 修复 → rollout 成功率应回升 ~50-60%。
+  自检：dump 一帧 `raw_actions[0]` 应在**当前 qpos 附近的小幅运动**，而非跳到平均位姿；dump norm_stats mean/std 应与 eval 那份一致。
+
 ### 2026-06-21 · Phase 4-EXPO · 修复 language instruction 不符（rollout 0% 元凶）· 参考 RLinf
 - **现象**：填好 drift ckpt + norm_stats、用 `--actor_only_base_actions` 且 `replan_steps=50`（动作选择/执行粒度已对齐 eval）后，
   EXPO rollout 仍 **0% 成功**，而 RoboTwin 自带 `eval_policy_client.py` 同 ckpt 跑 50-60%。逐项排除（图像 CHW/相机/动作反归一化/exec backend 均一致）后，
