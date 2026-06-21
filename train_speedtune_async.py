@@ -351,8 +351,9 @@ def _save_checkpoint(log_dir, learner, step):
         ckpt_dir = epath.Path(log_dir).resolve() / "checkpoints" / f"update_{step}"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         with ocp.StandardCheckpointer() as ckptr:
-            ckptr.save(ckpt_dir / "q_net", learner.q_net.params)
-            ckptr.save(ckpt_dir / "target", learner.target_params)
+            # force=True：final 与最后一次 interval 可能撞同一 update_N，覆盖而非报 "already exists"。
+            ckptr.save(ckpt_dir / "q_net", learner.q_net.params, force=True)
+            ckptr.save(ckpt_dir / "target", learner.target_params, force=True)
         logging.info("Saved SpeedTune DQN checkpoint at update %d", step)
     except Exception as e:
         logging.error("Checkpoint save failed: %s", e)
