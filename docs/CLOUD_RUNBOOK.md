@@ -281,7 +281,7 @@ print('info:', env.get_info_for_step())
 
 ```bash
 conda deactivate 2>/dev/null; cd <CLOUD>/expo-ft   # learner venv（GPU）
-CUDA_VISIBLE_DEVICES=0,1 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
 uv run python train_pi_robo_async.py \
     --config configs/model/expo_ft_pi_drift_config.py \
     --config_task configs/task/robotwin_stack_blocks.py \
@@ -292,7 +292,7 @@ uv run python train_pi_robo_async.py \
     --num_data 20 \
     --batch_size 64 --utd_ratio 20 \
     --max_steps 2000 \
-    --fsdp_devices 1
+    --fsdp_devices 1   # 4 卡 RTX 5880：device0 采样 + device1-3 更新（3 路数据并行）；显存紧可改 3（模型分片）
 ```
 关键 flag（与 DBPO 不同点）：
 - **`--dataset_path` 必填且必须是真实 RoboTwin demo 目录**（递归找 `episode{N}.hdf5`）。`process_robotwin_dataset`

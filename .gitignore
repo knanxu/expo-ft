@@ -13,3 +13,4 @@ client/droid/
 assets/
 .venv/
 client/.venv/
+.codegraph/
