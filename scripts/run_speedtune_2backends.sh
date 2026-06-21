@@ -31,6 +31,9 @@ MAX_ITERS="${MAX_ITERS:-100000}"
 SEED="${SEED:-42}"
 SERVER_WAIT="${SERVER_WAIT:-45}"                  # 等 server 渲染自检/就绪秒数
 TRAIN_MEM_FRAC="${TRAIN_MEM_FRAC:-0.85}"          # train VLA 单卡显存上限（独占一卡，留余量给碎片）
+# fixed_time(streaming) 每个 action hold 的物理步：250/这个=等效控制Hz。
+# 15≈16.7Hz=专家采集 save_freq 原速基线；增大→每 action 跟踪更久/更慢更平滑，减小→更快(<15 脱离真机)。
+STREAM_HOLD_STEPS="${STREAM_HOLD_STEPS:-15}"
 
 : "${SPEEDTUNE_VLA_CKPT:?请先 export SPEEDTUNE_VLA_CKPT=<微调后 drift pi0.5 ckpt 绝对路径>}"
 export SPEEDTUNE_VLA_CKPT
@@ -97,6 +100,7 @@ for i in "${!BACKENDS[@]}"; do
       --config configs/model/speedtune_dqn_config.py \
       --config.exec_backend "$be" \
       --config.max_iters "$MAX_ITERS" \
+      --config.stream_hold_steps "$STREAM_HOLD_STEPS" \
       --config_task "$TASK_CONFIG" \
       --client_host localhost --client_port "$port" \
       --seed "$SEED" \
