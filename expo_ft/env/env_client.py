@@ -139,6 +139,25 @@ class EnvClient:
         action_type = response.get("action_type", "policy")
         return real_action, action_type
 
+    def step_chunk(self, env_id: str, chunk: np.ndarray, speed_params: dict,
+                   exec_backend: str) -> Tuple[np.ndarray, dict]:
+        """Step a whole action chunk with SpeedTune speed control.
+
+        Returns (executed_action, info) where info has n_exec_steps / duration / exec_status.
+        New op; the per-action ``step`` above is untouched (EXPO/DBPO paths unchanged).
+        """
+        response = self._call_operation("step_chunk", {
+            "env_id": env_id, "chunk": np.asarray(chunk),
+            "speed_params": speed_params, "exec_backend": exec_backend,
+        })
+        executed = np.array(response.get("action", chunk))
+        info = {
+            "n_exec_steps": int(response.get("n_exec_steps", 0)),
+            "duration": float(response.get("duration", 0.0)),
+            "exec_status": response.get("exec_status", "success"),
+        }
+        return executed, info
+
     def get_observation(self, env_id: str) -> dict:
         """Get the observation of the environment."""
         response = self._call_operation("get_observation", {"env_id": env_id})
@@ -199,6 +218,14 @@ class EnvClientWrapper:
             Tuple of (real_executed_action, action_type) where action_type is "policy" or "human".
         """
         return self._call("step", lambda: self.client.step(self.env_id, action))
+
+    def step_chunk(self, chunk, speed_params, exec_backend):
+        """Step a whole chunk with SpeedTune speed control. Returns (executed_action, info)
+        where info = {n_exec_steps, duration, exec_status}."""
+        return self._call(
+            "step_chunk",
+            lambda: self.client.step_chunk(self.env_id, chunk, speed_params, exec_backend),
+        )
 
     def get_observation(self):
         """Get the observation of the environment."""

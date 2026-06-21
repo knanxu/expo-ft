@@ -54,6 +54,10 @@ class RoboTwinEnv:
         self.max_decision_steps = int(max_decision_steps)
         self.is_eval = is_eval
         self.video_dir = video_dir
+        # SpeedTune 整段执行参数（经 config-as-kwargs / create_env 传入；step_chunk 用）。
+        self._stream_hold_steps = int(kwargs.get("stream_hold_steps", 15) or 15)
+        _ks = kwargs.get("k_skip", None)
+        self._k_skip = int(_ks) if _ks not in (None, "", 0) else None
 
         self._seed = int(seed)
         self._ep_count = 0
@@ -251,6 +255,62 @@ class RoboTwinEnv:
         self._steps_since_reset += 1
         # RoboTwin take_action 不返回改写后的动作；executed = 下发的 qpos 目标。
         return {"executed_action": a}
+
+    # ---- SpeedTune 整段执行（新增，不改既有 per-action step）---------------
+    # exec_backend 名 → RoboTwin 三后端（envs/_base_task.py）方法选择。
+    _RT_BACKEND = {
+        "fixed_time": "streaming",          # 论文式固定时长（take_chunk_action_streaming）
+        "per_action_toppra": "per_action",  # 逐 action TOPP（take_chunk_action_per_action）
+        "chunk_toppra": "whole_chunk",      # 整段 TOPPRA（take_chunk_action）
+    }
+
+    def step_chunk(self, chunk, speed_params=None, exec_backend=None) -> Dict[str, Any]:
+        """整段执行一个 action chunk + 速度控制参数（SpeedTune 决策粒度）。
+
+        直接对接 RoboTwin 已内置的三种执行后端：chunk 压缩由 RoboTwin 的 ``reconstruct_chunk(v)``
+        内部完成，本适配器**只透传** v/vel_scale/acc_scale（不再自行压缩）。
+
+        Args:
+          chunk:        ``[H, n_real_dims]`` 绝对 qpos 目标序列（原始，不压缩）。
+          speed_params: {"v": 压缩比∈[1,4], "vel_scale": ∈[1,3], "acc_scale": ∈[1,3]}（见 exec_backends）。
+          exec_backend: "fixed_time"/"per_action_toppra"/"chunk_toppra"；缺省用 self.exec_backend。
+        Returns:
+          {"executed_action": 最后一帧 qpos, "n_exec_steps": 实际仿真帧数(dense_steps),
+           "duration": TOPPRA 时长(s), "exec_status": "success"/"topp_fallback"/"truncated"}。
+          reward/done 仍由 ``get_info_for_step`` 给出（稀疏 0/1；speed reward 在 learner 端 success-gated）。
+        """
+        speed_params = dict(speed_params or {})
+        backend = exec_backend or self.exec_backend
+        rt = self._RT_BACKEND.get(backend, "whole_chunk")
+        chunk = np.asarray(chunk, dtype=np.float64)
+        if chunk.ndim == 1:
+            chunk = chunk[None]
+        chunk = chunk[:, : self.n_real_dims]
+        v = float(speed_params.get("v", 1.0))
+        vel_scale = float(speed_params.get("vel_scale", 1.0))
+        acc_scale = float(speed_params.get("acc_scale", 1.0))
+        vsf = -1  # train 不实时录视频（eval 另设）
+
+        if rt == "streaming":
+            info = self.env.take_chunk_action_streaming(
+                chunk, v=v, hold_steps=self._stream_hold_steps,
+                max_actions=self._k_skip, video_save_freq=vsf)
+        elif rt == "per_action":
+            info = self.env.take_chunk_action_per_action(
+                chunk, vel_scale=vel_scale, acc_scale=acc_scale, v=v,
+                max_actions=self._k_skip, video_save_freq=vsf)
+        else:  # whole_chunk：整段 TOPPRA，k_skip 不适用
+            info = self.env.take_chunk_action(
+                chunk, vel_scale=vel_scale, acc_scale=acc_scale, v=v, video_save_freq=vsf)
+        info = info or {}
+        # episode 预算按消耗的 action 数累加（与 RoboTwin step_lim 同语义；后端内部也自查 step_lim）。
+        self._steps_since_reset += int(info.get("take_action_cnt_delta", 0) or 0)
+        return {
+            "executed_action": chunk[-1],
+            "n_exec_steps": int(info.get("dense_steps", 0) or 0),
+            "duration": float(info.get("duration", 0.0) or 0.0),
+            "exec_status": str(info.get("status", "success")),
+        }
 
     def get_info_for_step(self, raw_obs=None) -> Tuple[bool, bool, float, float]:
         """评测终止：(done, success, reward, mask)。稀疏 0/1 终局，无 shaping。"""

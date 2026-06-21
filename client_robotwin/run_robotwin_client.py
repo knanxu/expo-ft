@@ -71,6 +71,11 @@ async def _handle_environment_request(websocket: _server.ServerConnection):
                     env_kwargs = dict(task_config)
                     env_kwargs["video_dir"] = request.get("video_dir") or ""
                     env_kwargs["is_eval"] = (env_usage == "eval")
+                    # SpeedTune：透传执行后端参数（train 端 env_creation_request 里带；RoboTwinEnv
+                    # 显式收 exec_backend，k_skip/stream_hold_steps 走 **kwargs）。
+                    for _sk in ("exec_backend", "k_skip", "stream_hold_steps"):
+                        if request.get(_sk) is not None:
+                            env_kwargs[_sk] = request[_sk]
                     env = task_config.env(**env_kwargs)
                     _env_storage[env_id] = env
                     response = {
@@ -107,6 +112,32 @@ async def _handle_environment_request(websocket: _server.ServerConnection):
                             "status": "success",
                             "action": executed_action.tolist(),
                             "action_type": "policy",   # RoboTwin 仿真无 human override
+                        }
+                    await websocket.send(packer.pack(response))
+
+                elif operation == "step_chunk":
+                    # SpeedTune 整段执行：一次下发 chunk + 速度参数（不改既有 per-action step）。
+                    env = _env_storage.get(request["env_id"])
+                    if env is None:
+                        response = {"status": "error", "message": f"Env {request['env_id']} not found"}
+                    else:
+                        chunk = np.array(request["chunk"], dtype=np.float64)
+                        if not np.isfinite(chunk).all():
+                            logger.warning("Chunk has NaN/Inf; zero-filling.")
+                            chunk = np.where(np.isfinite(chunk), chunk, 0.0)
+                        result = env.step_chunk(
+                            chunk,
+                            speed_params=request.get("speed_params") or {},
+                            exec_backend=request.get("exec_backend"),
+                        )
+                        executed = np.array(result["executed_action"], dtype=np.float64)
+                        response = {
+                            "status": "success",
+                            "action": executed.tolist(),
+                            "n_exec_steps": int(result.get("n_exec_steps", 0)),
+                            "duration": float(result.get("duration", 0.0)),
+                            "exec_status": str(result.get("exec_status", "success")),
+                            "action_type": "policy",
                         }
                     await websocket.send(packer.pack(response))
 
