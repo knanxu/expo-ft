@@ -24,6 +24,7 @@ set -euo pipefail
 EXPO_ROOT="${EXPO_ROOT:-/home/xukainan/expo-ft}"
 ROBOTWIN_ROOT="${ROBOTWIN_ROOT:-/home/xukainan/RoboTwin}"
 ROBOTWIN_ENV="${ROBOTWIN_ENV:-RoboTwin}"                 # RoboTwin sim 的 conda env 名
+PYTHON="${PYTHON:-uv run python}"                        # learner 端 python（云端 uv；本地可设 .venv/bin/python）
 TASK_CONFIG="${TASK_CONFIG:-configs/task/robotwin_stack_blocks.py}"
 WANDB_PROJECT="${WANDB_PROJECT:-expo-ft-speedtune}"
 MAX_ITERS="${MAX_ITERS:-100000}"
@@ -80,7 +81,7 @@ for i in "${!BACKENDS[@]}"; do
   echo "[$be] 启动训练  gpu=$gpu  client_port=$port  wandb_run=$run_name"
   CUDA_VISIBLE_DEVICES="$gpu" XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
   WANDB_PROJECT="$WANDB_PROJECT" \
-    "$EXPO_ROOT/.venv/bin/python" train_speedtune_async.py \
+    $PYTHON train_speedtune_async.py \
       --config configs/model/speedtune_dqn_config.py \
       --config.exec_backend "$be" \
       --config.max_iters "$MAX_ITERS" \
