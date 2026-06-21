@@ -123,11 +123,22 @@ def main(_):
     wandb.config.update(FLAGS.flag_values_dict(), allow_val_change=resuming)
 
     if FLAGS.config_task.env_type in ('droid', 'sim'):
-        dataset = process_droid_dataset(
-            FLAGS.dataset_path,
-            FLAGS.config_task,
-            num_data=FLAGS.num_data,
-        )
+        # 按 task config 的 dataset_loader 分发离线 demo loader（默认 'droid'，保持 DROID 路径不变）。
+        # RoboTwin demo hdf5 格式与 DROID 不同 → 走 process_robotwin_dataset（零侵入，新文件）。
+        loader = getattr(FLAGS.config_task, "dataset_loader", "droid")
+        if loader == "robotwin":
+            from expo_ft.env.robotwin_utils import process_robotwin_dataset
+            dataset = process_robotwin_dataset(
+                FLAGS.dataset_path,
+                FLAGS.config_task,
+                num_data=FLAGS.num_data,
+            )
+        else:
+            dataset = process_droid_dataset(
+                FLAGS.dataset_path,
+                FLAGS.config_task,
+                num_data=FLAGS.num_data,
+            )
         example_action = dataset[0]['actions'][np.newaxis]
     else:
         raise ValueError(f"Unsupported dataset type: {FLAGS.config_task.env_type}")

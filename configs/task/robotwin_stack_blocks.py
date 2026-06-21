@@ -29,6 +29,7 @@ def get_config():
 
     # --- learner 用（train_pi_robo_dbpo 读取）---
     config.env_type = "sim"               # 走 train_pi_robo 的 ('droid','sim') 分支
+    config.dataset_loader = "robotwin"    # EXPO/BC 走 process_robotwin_dataset（读 RoboTwin demo hdf5），非 DROID loader
     config.control_hz = 25                # RoboTwin 控制频率（按你的设置确认）
     config.residual_action_xyzg = False   # RoboTwin 用 14 维关节动作，非 DROID 的 xyzg 残差
     config.example_action = np.zeros((1, 14), dtype=np.float32)  # 双臂 14 维占位

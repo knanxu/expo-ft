@@ -243,7 +243,33 @@ DBPOLearner:
 - **关键发现**：① plain `jax.grad` 可穿 `nnx.merge + _sample_actions_drifting` 求出 pi0.5 actor 梯度（nnx.State 叶子是 ArrayImpl）；② 全量 finetune adam = 24GB 不可行 → **trainable_filter 非可选**；③ value 用 `cond_emb`（池化观测特征）。
 - **未尽（→ Phase 4）**：把 `run_ppo_iteration` + rollout 采集接进 `train_pi_robo*.py`（真实 DBP checkpoint 加载 + env_client）；LoRA 感知的 trainable_filter 在真实 config 上核对；ratio 保真度的 matmul 精度设置。
 
-### Phase 4 — RoboTwin 仿真闭环（独立 client 包）+ 训练脚本接线 + 调参
+### Phase 4-EXPO — EXPO-FT 原算法 × drift × RoboTwin（**当前第一优先级，2026-06-21 插入**）
+> **先于 Phase 4（DBPO）。** 让现成 `EXPOLearner`/`BCLearner` 在 drift pi0.5 + RoboTwin 上闭环——风险最低、
+> 最快验证 env/checkpoint/数据管线，给 DBPO 打底。核心事实：drift 对 EXPO 是**纯 config 切换**（`pi0.py`
+> `sample_actions:347`/`compute_loss:254` 已按 `use_drifting_loss` 分发），obs/action 走 openpi 同套 transforms，
+> EXPO `sample_actions:532` 已含 `process_transformed_outputs` 反归一化，**不用改算法、不用写新训练入口**。
+
+- [x] **新 model config** `configs/model/expo_ft_pi_drift_config.py`（拷 `expo_ft_pi_config.py` 改）：
+      `pi05_config_name="pi05_aloha_robotwin_drifting_stack_blocks_two"`、`residual_action_xyzg=False`、
+      `freeze_pi05_encoder=True`、`actor_success_only=True`。**不改** `expo_ft_pi_config.py`。
+      🔴 仍需用户填 `pi05_weight_loader_path`(DBP drift ckpt) + `pi05_assets_dir/asset_id`(RoboTwin norm_stats)。
+- [x] **RoboTwin 数据 loader** `expo_ft/env/robotwin_utils.py::process_robotwin_dataset`（新文件，**不改** DROID 路径）：
+      读 RoboTwin demo hdf5（`joint_action/vector`(T,14) + `observation/{head,left,right}_camera/rgb` JPEG），
+      产出与 `RoboTwinEnv.get_observation` **完全相同的扁平键**。`train_pi_robo_async.py` 按
+      `config_task.dataset_loader`(="robotwin") 分发（DROID 默认 'droid' 不变）。**已在真实 episode 冒烟通过**
+      （253 帧、键一致、图像 CHW、state(14)、actions(14)、终局 done/reward 正确）。
+- [x] **🟡→✅ 图像 HWC/CHW 已定论 = CHW**：`aloha_policy.py:171` `_decode_aloha.convert_image` 做
+      `einops.rearrange(img, "c h w -> h w c")` → **AlohaInputs 期望 CHW 输入**。`RoboTwinEnv._chw` 与 loader 均产 CHW，正确一致。
+- [ ] **运行**：启 `client_robotwin/run_robotwin_client.py`（RoboTwin venv）→ 跑现成
+      `train_pi_robo_async.py --config configs/model/expo_ft_pi_drift_config.py --config_task configs/task/robotwin_stack_blocks.py --dataset_path <RoboTwin demo dir>`。
+- [ ] 前置：greedy（drift mean）评 DBP baseline 成功率>0；核对 `control_hz`/`replan_steps`/`max_decision_steps`（EXPO 按单 action 计数）。
+- [ ] **🟡 端到端集成**：用真实 DBP ckpt + norm_stats 验证 obs dict 流经 replay buffer robotwin transform（`_preprocess_single_transition`）
+      与 `process_raw_inputs` 不报错；drift 多候选采样（EXPO `N=8`）noise 形状路径；`freeze_pi05_encoder=True` 与 drift `noise_samples` 分支。
+- [ ] 验证不回归：DROID/EXPO 既有路径行为不变（dispatch 默认 'droid' 字节等价）；DBPO 31 测试仍过。
+- **交付**：EXPO-FT（off-policy actor-critic）在 RoboTwin drift pi0.5 上的可训练闭环 + 初步学习曲线。
+- **运行时待确认**：drift 多候选采样（EXPO `N=8`）的 noise 形状路径；`freeze_pi05_encoder=True` 与 drift `noise_samples` 分支。
+
+### Phase 4 — RoboTwin 仿真闭环（独立 client 包）+ 训练脚本接线 + 调参（DBPO，**Phase 4-EXPO 之后**）
 > 本阶段以 **RoboTwin 仿真**（stack two blocks）为首个验证环境，替代原计划的真机；真机迁移留到 Phase 4+。
 
 **4a — RoboTwin 独立 client 包（零污染 DROID client）**
@@ -382,6 +408,74 @@ git merge improved/feat/jax-return-hidden
 ## 7. 进展日志 / Changelog
 
 > 倒序追加，每条：日期 · 阶段 · 改动 · 涉及文件 · 验证结果 · 下一步。
+
+### 2026-06-21 · Phase 4-EXPO · 修复 aloha/robotwin repack 的 `action` 键接缝 + 云端 runbook 扩 EXPO track
+- **背景**：审计「obs dict 流经 replay buffer robotwin transform / `process_raw_inputs` 不报错」这道之前未勾选的接缝时，
+  发现 **真实 bug**：robotwin/aloha 的 openpi repack 用 LeRobot 约定 `{"actions": "action"}`（**单数** `action`，
+  `config.py:250/662`、`action_sequence_keys=("action",)`，DBP 训练依赖、**不能改**），而 EXPO 数据管线（为 DROID 写）
+  两处都只提供**复数** `actions`：① `replay_buffer.py::insert`（`offline_ratio=0` 默认 → `BatchProcessor.__init__`
+  首次 `insert_dataset` 即触发）；② `pi05.py::process_raw_inputs`（在线采样的 dummy）。`RepackTransform.__call__` 做
+  `flat_item["action"]` → **KeyError**，learner 在训练开始前就崩。DROID 因用自定义 `{"actions": "actions"}` 不受影响。
+- **修复（纯增量、DROID 行为不变）**：两处各**追加**一个 `action` 别名键——
+  ① `insert`：`obs_data_dict["action"] = action_chunk_raw`（(H,14) 真实 chunk，作 actor 训练 target）；
+  ② `process_raw_inputs`：`raw_observations["action"] = np.zeros((action_horizon, action_dim))`（**2D** dummy，
+  因 AlohaInputs `_encode_actions_inv` 做 `actions[:, [6,13]]` 需 2D；该 dummy 经 `Observation.from_dict` 后即丢，仅形状要过 transform）。
+  DROID repack 读 `actions`、忽略 `action` 键，故 DROID/DBPO 路径字节不变。
+- **另一定论**：`aloha_policy.py:171` `convert_image` **无条件** `c h w -> h w c` → AlohaInputs 期望 **CHW 输入**；
+  `RoboTwinEnv._chw` 与 `process_robotwin_dataset._decode_rgb_chw` 均产 CHW，三方一致（图像轴序无 bug）。
+- **验证**：DBPO 12 测试全过（`dbpo_dryrun_test` 7 + `dbpo_pi05_test` 5，覆盖共享 pi05/transforms → 修复无回归）；
+  EXPO model config + robotwin loader 在 `.venv` 加载/导入 OK；learner venv 已含 cv2 4.11/h5py 3.16（loader 依赖经 openpi 传递）。
+  **仍待云端验证**：真实 DBP ckpt + norm_stats 下端到端 transform（runbook gate 6-EXPO 设了诊断点）。
+- **runbook**：`docs/CLOUD_RUNBOOK.md` 重构为 **EXPO-FT(track A，优先) / DBPO(track B)** 双轨——步骤 0–5 共用，
+  3/6/7 分叉；补 ≥2 GPU 要求、`--dataset_path`(真实 RoboTwin demo)、`--max_steps`(非 `--max_iters`)、norm_stats 必填、
+  EXPO 监控键（`training/critic_loss`/`residual_q`/...）、排查表 EXPO 行。
+- **涉及文件**：`expo_ft/data/replay_buffer.py`、`expo_ft/agents/vla/pi05.py`、`docs/CLOUD_RUNBOOK.md`、`docs/DBPO_DEV.md`。
+- **下一步**：用户填 DBP ckpt + norm_stats → 云端 `git pull` → 步骤 4 greedy gate → 步骤 5 env-server → 步骤 6-EXPO learner。
+
+### 2026-06-21 · Phase 4-EXPO 起步 · 新 model config + RoboTwin demo loader + dispatch ✅（冒烟过）
+- **改动（纯增量，零侵入）**：
+  - 新增 `configs/model/expo_ft_pi_drift_config.py`：`EXPOLearner` + `pi05_aloha_robotwin_drifting_stack_blocks_two`
+    （drift）+ `residual_action_xyzg=False` + `freeze_pi05_encoder=True`。**不改** `expo_ft_pi_config.py`。
+  - 新增 `expo_ft/env/robotwin_utils.py::process_robotwin_dataset`：读 RoboTwin demo hdf5
+    （`joint_action/vector` + 各相机 JPEG `rgb`），产出与 `RoboTwinEnv.get_observation` 同键的 transition。**不改** `droid_utils.py`。
+  - `train_pi_robo_async.py`：离线 loader 按 `config_task.dataset_loader` 分发（默认 'droid' → DROID 路径字节不变；
+    'robotwin' → 新 loader）。`configs/task/robotwin_stack_blocks.py` 加 `dataset_loader="robotwin"`。
+- **关键定论 ①（图像轴序）**：= **CHW**（`aloha_policy.py:171` AlohaInputs 内部 `c h w -> h w c`，故期望 CHW 输入）——
+  RoboTwinEnv 与 loader 均产 CHW，原先标的 🟡 HWC/CHW 风险**消除**。
+- **关键定论 ②（动作时序）**：DBP 训练管线 `policy/pi05/scripts/process_data.py:103-124` 用
+  **`action[t] = state[t+1]`**（下一帧绝对 qpos 目标，**非 delta**），`observation.state[t]=state[t]`，共 T-1 行。
+  loader 已对齐（原先误用同帧 `vector[t]` → 修正为 `vector[t+1]`）——与在线 rollout 一致（策略输出"下一目标 qpos"，
+  `RoboTwinEnv.step` 经 `take_action(qpos)` 下发绝对目标）。state 布局 `[左臂6,左夹爪1,右臂6,右夹爪1]` 三方一致。
+- **数据管线分工**：`script/collect_data.py` 脚本自动采专家 demo（**无需键鼠手采**）→ 原始
+  `data/{task}/{setting}/data/episode*.hdf5`（`joint_action/vector` + JPEG rgb）= **loader 直接读的**；
+  `policy/pi05/process_data_pi05.sh`(→`scripts/process_data.py`+`compute_norm_stats.py`) 转 LeRobot **仅供 DBP 训练**
+  产 drift ckpt + **norm_stats**（后者正是 EXPO replay buffer 必需的 `pi05_assets_dir/asset_id`）。EXPO buffer 自己跑 openpi transforms，不吃 LeRobot。
+- **env A+B 已落地**（本仓当前 `robotwin_env.py`）：episode 预算用 RoboTwin 自带 `step_lim`
+  （`_eval_step_limit.yml`：stack_blocks_two=**800**，非硬编 200）+ episode 间 `close_env(clear_cache)` 防 sapien 泄漏 + UnStableError 换 seed 重试。
+- **验证**：`.venv` 下 ① py_compile 全过；② model/task config 学习器侧加载正常（RoboTwin 依赖 guard 跳过）；
+  ③ `process_robotwin_dataset` 在真实 `shake_bottle` episode 跑通（253 帧，键/CHW/14-D/终局 reward 均正确）。
+- **涉及文件**：新增 `configs/model/expo_ft_pi_drift_config.py`、`expo_ft/env/robotwin_utils.py`；
+  改 `train_pi_robo_async.py`（dispatch）、`configs/task/robotwin_stack_blocks.py`（dataset_loader）。
+- **下一步**：用户填 DBP drift ckpt + RoboTwin norm_stats（`pi05_weight_loader_path`/`pi05_assets_dir`/`pi05_asset_id`）→
+  启 robotwin server → 端到端集成（obs 流经 replay buffer robotwin transform；drift N=8 多候选采样路径）。
+
+### 2026-06-21 · 优先级调整 · EXPO-FT × drift × RoboTwin 提到第一优先（先于 DBPO）
+- **决策**：先让 EXPO-FT 原算法（`EXPOLearner`/`BCLearner`）在 drift pi0.5 + RoboTwin 上跑通，再回到 DBPO。
+  新增 **Phase 4-EXPO**（见 §4），插在 Phase 4（DBPO）之前。
+- **关键调研结论（本轮代码核对）**：
+  - **drift 对 EXPO 是纯 config 切换**：合并后 `pi0.py` 的 `sample_actions:347` / `compute_loss:254` 已按
+    `use_drifting_loss` 自动分发到 `_sample_actions_drifting` / `_compute_loss_drifting`；EXPO 的采样
+    （`_jitted_infer→Policy.infer→model.sample_actions`）与 actor 更新（`train_step→compute_loss`）天然吃到，**零算法代码改动**。
+  - **obs/action 天然兼容 RoboTwin**：replay buffer 的 3 路图像槽（`base_image`/`left_wrist_image`/`right_wrist_image`）
+    对上 aloha 三相机；`RoboTwinEnv.get_observation` 返回的 `observation.images.cam_high/...` 正是 robotwin RepackTransform 读的键；
+    buffer 与 `process_raw_inputs` 走同套 openpi robotwin transforms。
+  - **EXPO 已含动作反归一化**：`sample_actions:532` 调 `process_transformed_outputs`（Unnormalize+AlohaOutputs）——
+    这正是 DBPO rollout（`train_pi_robo_dbpo_async.py`）缺的步（DBPO 直接下发归一化 mean，Phase 4 待补）。
+  - **不用写新训练入口**：EXPO/BC+drift+RoboTwin 直接复用 `train_pi_robo_async.py` 的 `EXPOLearner` 分支。
+  - **待补接缝**：新 `expo_ft_pi_drift_config.py`、RoboTwin 数据 loader（`process_droid_dataset` 是 DROID 专用）、
+    DBP ckpt 路径、图像 HWC/CHW 轴序核对（同 DBPO 隐患）。
+- **涉及文件**：`CLAUDE.md`（标题/优先级块/第一原则/env 算法无关/新 config/新训练入口 多处）、`docs/DBPO_DEV.md`（本条 + Phase 4-EXPO）。
+- **下一步**：起草 `configs/model/expo_ft_pi_drift_config.py` + RoboTwin 数据 loader/stub + 图像轴序冒烟核对。
 
 ### 2026-06-18 · Phase 4 前期 · RLinf 调研 + value 头改 suffix/stop_grad + RoboTwin client 计划
 - **调研**：拆解 RLinf（`/home/xukainan/RLinf`）在 RoboTwin 上对 pi0.5 做 PPO 的实现，产出
