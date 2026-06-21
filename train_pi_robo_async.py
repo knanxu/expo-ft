@@ -53,6 +53,12 @@ flags.DEFINE_string("client_host", "localhost", "Host for environment operations
 flags.DEFINE_integer("client_port", 8102, "Port for environment operations server.")
 
 flags.DEFINE_integer("replan_steps", 8, "Number of replan steps for evaluation.")
+flags.DEFINE_boolean(
+    "actor_only_base_actions", False,
+    "Diagnostic (EXPO/BC): rollout uses the base policy action only — no residual edit, "
+    "no Q-value candidate selection. Use to check whether the base (drift) policy reproduces "
+    "the greedy eval before the critic/residual are trained. Default False = normal EXPO selection.",
+)
 
 flags.DEFINE_string("dataset_path", "", "Path to the dataset.")
 config_flags.DEFINE_config_file(
@@ -367,7 +373,9 @@ def main(_):
         # Skip model inference while human is controlling.
         if not action_plan and action_type != "human":
             sample_start = time.time()
-            action_chunk, _actor_agent, new_si = _actor_agent.sample_actions(observation)
+            action_chunk, _actor_agent, new_si = _actor_agent.sample_actions(
+                observation, only_base_actions=FLAGS.actor_only_base_actions
+            )
             episode_log.sample_info_history.append(new_si)
             training_log.record_sample_time(time.time() - sample_start, step_metrics)
             action_plan.extend(action_chunk[:FLAGS.replan_steps])

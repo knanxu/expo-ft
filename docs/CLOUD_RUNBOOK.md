@@ -315,6 +315,11 @@ uv run python train_pi_robo_async.py \
 4. **无 NaN**：`training/*` loss 有限；`rollout/success_rate` 出现（>0 最好，0 也先看是否 episode 正常 done）。
    （`rollout/success_rate` 恒 0 → 回步骤 4 确认 greedy baseline 本身 >0，否则 RL 无正信号。）
 
+> **诊断 `--actor_only_base_actions`**：EXPO rollout 默认不是 greedy——它从 N 个 base 候选 + residual 编辑候选里用
+> critic `argmax` 选一个，训练初期 critic 随机 → 选择差 → 早期成功率低/0 属正常冷启动。加 `--actor_only_base_actions`
+> 让 rollout **只用 base drift 动作**（不编辑、不 Q 选择），用来判别：base-only 能复现 ~50% → 配置正确、是冷启动（继续训会好）；
+> base-only 仍 0% → 是权重/norm_stats/obs/动作问题，回步骤 3-EXPO 查。默认 False，不影响正常训练。
+
 ---
 
 ## 步骤 6-DBPO（track B）— 启 learner（DBPO async 训练）
