@@ -409,6 +409,24 @@ git merge improved/feat/jax-return-hidden
 
 > 倒序追加，每条：日期 · 阶段 · 改动 · 涉及文件 · 验证结果 · 下一步。
 
+### 2026-06-21 · Phase 4-EXPO · 修复 language instruction 不符（rollout 0% 元凶）· 参考 RLinf
+- **现象**：填好 drift ckpt + norm_stats、用 `--actor_only_base_actions` 且 `replan_steps=50`（动作选择/执行粒度已对齐 eval）后，
+  EXPO rollout 仍 **0% 成功**，而 RoboTwin 自带 `eval_policy_client.py` 同 ckpt 跑 50-60%。逐项排除（图像 CHW/相机/动作反归一化/exec backend 均一致）后，
+  **用户定位到根因 = 语言 instruction 不符**。
+- **根因（两层）**：
+  - ① **EXPO env 没生成真实指令**：`RoboTwinEnv.reset` 里 `_resolve_instruction()` 调 `get_instruction()` 时 RoboTwin 还没注入指令（`_base_task.py:577` 返回 `self.instruction=None`）→ 回退到固定串 "stack the two blocks"。从未调用 RoboTwin 的指令生成。
+  - ② **repack 丢 prompt**：robotwin 的 openpi repack 结构无 `prompt` 键（`config.py:654-664`）→ 推理/replay buffer 跑 repack 时把 obs 的 prompt 丢掉 → `InjectDefaultPrompt` 塞回 config 默认串 `_ROBOTWIN_DRIFTING_PROMPTS["stack_blocks_two"]`="stack the two blocks"。（DROID repack 含 `"prompt":"prompt"` 故无此问题；标准 openpi **推理不跑 repack**，故 eval 没事。）
+  - **真实指令**是**每集随机的模板**（`description/task_instruction/stack_blocks_two.json` 的 `{A}=red block/{B}=green block/{a}{b}=arm` 占位），如 *"Place red block and green block centrally, then stack green block on red block."*——**不是** "stack the two blocks"。
+- **权威参考**：① `eval_policy_client.py:403/435-438`（用户跑通的 50-60% 路径）：`play_once()` 拿 `episode_info` → `generate_episode_descriptions(task, [info], N)` → `np.random.choice(results[0][instruction_type])` → `set_instruction`。
+  ② **RLinf** `RoboTwin-rlinf/robotwin/envs/vector_env.py:107/115/117`：`task.get_info()` 拿 info（**只取一次、缓存**）→ 每集 `create_instruction()` 随机选 → `obs["instruction"]`。RL loop 里**不跑专家**。
+- **修复（RLinf 对齐，纯增量）**：
+  - ① `client_robotwin/envs/robotwin_env.py`：`_ensure_episode_info()` 启动跑**一次** `play_once` 缓存 `episode_info`（本仓 RoboTwin 无 `get_info`，info 只在 play_once 填）；`_create_instruction()` 每集用缓存 info 经 `generate_episode_descriptions` + `np.random.choice` 随机选模板，`set_instruction` → `obs["prompt"]`。`instruction_type` 默认 "seen"，可配。
+  - ② `expo_ft/utils/train_utils.py::build_pi05_config`：给缺 `prompt` 的 aloha/robotwin repack **补 `"prompt":"prompt"`**（DROID 已含→no-op），让每集真实指令流到策略；`pi05.py::process_raw_inputs` 与 `replay_buffer.py::insert` 加 `setdefault("prompt", ...)` 兜底（无 prompt 输入不致 repack KeyError，DBPO 安全）。
+  - ③ `expo_ft/env/robotwin_utils.py`：离线 loader 从 `data/<task>/<config>/instructions/episode{N}.json` 读每集真实指令存进 `obs["prompt"]`（与在线 rollout 同分布），新增 `config.instruction_type`。
+- **验证**：① 本地 `generate_episode_descriptions` 产出真实指令（seen/unseen 各 100 条，样例如上）；② `build_pi05_config` 后 robotwin repack 结构含 `prompt`；③ 6 文件语法 OK；④ DBPO 12 测试回归。**待云端验证**：填对 `instruction_type` 后 rollout 成功率应回升到 ~50-60%。
+- **涉及文件**：`client_robotwin/envs/robotwin_env.py`、`expo_ft/utils/train_utils.py`、`expo_ft/agents/vla/pi05.py`、`expo_ft/data/replay_buffer.py`、`expo_ft/env/robotwin_utils.py`、`configs/task/robotwin_stack_blocks.py`、`docs/CLOUD_RUNBOOK.md`。
+- **下一步（可选优化）**：若给本仓 RoboTwin 加 `get_info()`（仿 RLinf）即可免去启动那次 `play_once`；arm tag 现用首集缓存值（块颜色永远对），需更精确可改每集取。
+
 ### 2026-06-21 · Phase 4-EXPO · 修复 aloha/robotwin repack 的 `action` 键接缝 + 云端 runbook 扩 EXPO track
 - **背景**：审计「obs dict 流经 replay buffer robotwin transform / `process_raw_inputs` 不报错」这道之前未勾选的接缝时，
   发现 **真实 bug**：robotwin/aloha 的 openpi repack 用 LeRobot 约定 `{"actions": "action"}`（**单数** `action`，

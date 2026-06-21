@@ -20,6 +20,7 @@ RoboTwin hdf5 结构（核对自真实 episode + `pkl2hdf5.py` / `policy/ACT/pro
 这些 demo 经 `PiReplayBuffer.insert_dataset` 标 is_hil/is_success=True，进入 EXPO 的 success-only actor 更新与 critic 暖启。
 """
 
+import json
 import os
 
 import cv2
@@ -57,6 +58,26 @@ _CAM_MAP = {
 }
 
 
+def _episode_instruction(ep_file, instruction_type, fallback):
+    """读该 episode 的真实指令（RoboTwin 把每集指令存在 data/ 的 sibling
+    `instructions/episode{N}.json`，含 {"seen":[...], "unseen":[...]}），随机选一条 instruction_type 模板。
+    与在线 rollout（RoboTwinEnv._create_instruction）/ DBP 训练同分布——而非固定的 task language_instruction，
+    否则离线 demo 的 prompt 与策略期望不符（详见 docs/DBPO_DEV.md 的 instruction 接缝）。缺失则回退 fallback。
+    """
+    stem = os.path.splitext(os.path.basename(ep_file))[0]                # episode{N}
+    # ep_file = <config>/data/episode{N}.hdf5 → <config>/instructions/episode{N}.json
+    jpath = os.path.join(os.path.dirname(os.path.dirname(ep_file)), "instructions", f"{stem}.json")
+    try:
+        with open(jpath, "r", encoding="utf-8") as jf:
+            d = json.load(jf)
+        pool = d.get(instruction_type) or d.get("seen") or []
+        if len(pool) > 0:
+            return str(np.random.choice(pool))
+    except Exception:
+        pass
+    return fallback
+
+
 def process_robotwin_dataset(datapath, task_config, episode_indices=None, num_data=None):
     """Load RoboTwin demos as EXPO-FT transitions (drop-in for process_droid_dataset).
 
@@ -78,10 +99,12 @@ def process_robotwin_dataset(datapath, task_config, episode_indices=None, num_da
         ep_files = ep_files[:num_data]
 
     prompt = getattr(task_config, "language_instruction", "")
+    instruction_type = getattr(task_config, "instruction_type", "seen")
     print(f"Found {len(_discover_episode_files(datapath))} RoboTwin episodes; using {len(ep_files)}")
 
     data = []
     for ep in tqdm(ep_files):
+        ep_prompt = _episode_instruction(ep, instruction_type, prompt)
         with h5py.File(ep, "r") as f:
             vector = np.asarray(f["joint_action"]["vector"], dtype=np.float32)  # (T, 14)
             T = len(vector)
@@ -107,7 +130,7 @@ def process_robotwin_dataset(datapath, task_config, episode_indices=None, num_da
             for t in range(n):
                 obs = {flat_key: cams[flat_key][t] for flat_key in _CAM_MAP.values()}
                 obs["observation.state"] = vector[t]
-                obs["prompt"] = prompt
+                obs["prompt"] = ep_prompt
                 data.append({
                     "observations": obs,
                     "actions": vector[t + 1],      # 下一帧绝对 qpos 目标（对齐 DBP action[t]=state[t+1]）

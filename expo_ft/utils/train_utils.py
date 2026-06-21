@@ -103,6 +103,26 @@ def build_pi05_config(config):
             pi05_train_config,
             data=dataclasses.replace(pi05_train_config.data, assets=new_assets),
         )
+
+    # Aloha/RoboTwin 的 openpi repack 默认**不含** "prompt"（DROID 的含），推理/replay buffer 跑 repack 时
+    # 会丢掉每集 instruction → 被 InjectDefaultPrompt 替成 config 默认串 → 语言条件与训练/eval 不符（rollout 失败）。
+    # 给缺 "prompt" 的 RepackTransform 补 "prompt":"prompt"，让每集真实 instruction 流到策略。
+    # DROID 已含 → no-op；输入无 prompt 时由 process_raw_inputs / replay_buffer.insert 的 setdefault 兜底。
+    _data = pi05_train_config.data
+    _rt = getattr(_data, "repack_transforms", None)
+    if _rt is not None and getattr(_rt, "inputs", None):
+        _new_inputs, _changed = [], False
+        for _tr in _rt.inputs:
+            _struct = getattr(_tr, "structure", None)
+            if isinstance(_struct, dict) and "prompt" not in _struct:
+                _tr = dataclasses.replace(_tr, structure={**_struct, "prompt": "prompt"})
+                _changed = True
+            _new_inputs.append(_tr)
+        if _changed:
+            pi05_train_config = dataclasses.replace(
+                pi05_train_config,
+                data=dataclasses.replace(_data, repack_transforms=dataclasses.replace(_rt, inputs=_new_inputs)),
+            )
     return agent_kwargs, pi05_train_config, pi05_resize_size, model_cls
 
 

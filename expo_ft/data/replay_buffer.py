@@ -232,6 +232,9 @@ class PiReplayBuffer(Dataset):
         # of config: DROID's repack reads "actions" and harmlessly ignores this extra "action"
         # entry, so existing DROID/EXPO behavior is unchanged (zero-intrusion, additive only).
         obs_data_dict["action"] = action_chunk_raw
+        # robotwin/aloha repack 现含 "prompt"（见 build_pi05_config）；离线 loader / 在线 rollout 的 obs 通常已带，
+        # 这里兜底避免无 prompt 输入触发 repack KeyError（有真实 prompt 时不覆盖）。
+        obs_data_dict.setdefault("prompt", "")
         obs_data_dict["rewards"] = np.asarray(data_dict["rewards"])
         obs_data_dict["masks"] = np.asarray(data_dict["masks"])
         obs_data_dict["dones"] = np.asarray(data_dict["dones"])

@@ -371,6 +371,7 @@ wandb / 日志看：
 | 步骤6-EXPO loader `No RoboTwin episode*.hdf5 found` | `--dataset_path` 没指到含 `episode{N}.hdf5` 的目录（指 `collect_data.py` 原始 demo 目录，非 LeRobot 转换目录） |
 | 步骤6-EXPO loader KeyError `left_camera`/`right_camera` | demo 采集时未存三相机 rgb；`process_robotwin_dataset._CAM_MAP` 要 head+left+right。换三相机齐全的 demo（与 demo_clean 同 data_type） |
 | 步骤6-EXPO `Normalization stats not found ... raise ValueError` | EXPO replay buffer 强制要 norm_stats；`expo_ft_pi_drift_config.py` 的 `pi05_assets_dir/pi05_asset_id` 必填，指 DBP norm_stats（见步骤 3-EXPO） |
+| 步骤6-EXPO rollout 成功率 0（但步骤4 greedy baseline 正常） | 多半 **language instruction 不符**：策略训练/eval 用的是**每集随机模板指令**（如 "Place red block and green block centrally, then stack green block on red block."），EXPO 旧版用固定 "stack the two blocks"。已按 RLinf 修（`RoboTwinEnv` 每集生成 + repack 保留 prompt + loader 读真实指令）。确认 `config_task.instruction_type` 与 gate-4 eval 的 `--instruction_type` **一致**；env 启动日志应见 `cached episode_info for instructions: {...}`（没有则 play_once 失败→走 fallback，查 curobo/seed） |
 | obs transform 报相机/键错 | `robotwin_task_config` 未启用对应相机 / RoboTwin get_obs 相机名≠head/left/right_camera |
 | `assets/objects/objaverse/list.json` FileNotFoundError（import envs 或起 server 时） | ① **cwd 不对**：RoboTwin import 期用相对路径读 assets——gate 2b 从 RoboTwin 根跑；server 端 `run_robotwin_client` 已 `os.chdir(robotwin_root)` 兜底。② **文件真缺**：该索引不入 git，须由 RoboTwin assets 下载提供（仅 import 需 list.json 这 22KB 索引；stack_blocks_two 运行期不加载 objaverse mesh） |
 | ratio 首更新 ≠1（>1.01） | matmul 精度（脚本已设 highest）/ z 未正确复用 / logp_old 未在采集时存 |

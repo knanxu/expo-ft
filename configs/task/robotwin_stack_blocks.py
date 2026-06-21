@@ -40,6 +40,9 @@ def get_config():
     config.n_real_dims = 14                   # 双臂 2×(6关节+1夹爪)
     config.max_decision_steps = 200           # 每 episode 最多 env-step（对齐 RLinf max_episode_steps）
     config.seed = 0
+    # RLinf 对齐：每集随机模板指令的池（"seen"/"unseen"）。env 与离线 loader 都读它。
+    # ⚠️ 务必与你 gate-4 eval（eval_policy_client 的 --instruction_type）一致，否则语言分布不符。
+    config.instruction_type = "seen"
     # RoboTwin 场景配置：只填要加载的 task_config yaml 名 + 少量覆盖项；camera/embodiment/
     # data_type/domain_randomization 由适配器按 RoboTwin eval_policy.py 的方式从该 yaml **二次解析**
     # （见 client_robotwin/envs/robotwin_env.py::_resolve_setup_kwargs），无需在此手写大段嵌套配置。

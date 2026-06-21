@@ -36,7 +36,7 @@ class RoboTwinEnv:
         task_name: str = None,
         robotwin_task_config: Optional[dict] = None,
         *,
-        instruction_type: str = "unseen",
+        instruction_type: str = "seen",     # 模板池（"seen"/"unseen"）；务必与 gate-4 eval 的 --instruction_type 一致
         exec_backend: str = "per_action",   # 方式2（逐 action TOPP）；与每步一个 action 协议匹配
         n_real_dims: int = 14,              # 双臂 2×(6关节+1夹爪)
         max_decision_steps: int = 200,      # 每 episode 最多 env-step（与 RLinf max_episode_steps 一致）
@@ -72,6 +72,9 @@ class RoboTwinEnv:
         # sapien 资源释放周期（对齐 RoboTwin eval 的 clear_cache_freq，demo_clean.yml=5）。
         self._clear_cache_freq = int(self._setup_kwargs.get("clear_cache_freq", 5) or 5)
         self._max_reset_retries = 20        # setup_demo 不稳定 seed 的最大换 seed 次数
+        # RLinf 对齐（vector_env.py:107/115）：缓存一次 RoboTwin episode_info（占位符 {A}/{B}/{a}/{b}），
+        # 供每集随机生成模板指令。None=未取；{}=已尝试但失败（走 fallback，不再重试）。
+        self._episode_info = None
 
     # ---- RoboTwin env 构造（等价 eval_policy.class_decorator）----
     def _make_env(self):
@@ -165,6 +168,9 @@ class RoboTwinEnv:
         except Exception:
             UnStableError = ()  # 退化：仅靠下面的通用 Exception 兜底
 
+        # RLinf 对齐：首集前一次性取并缓存 episode_info（供模板指令生成）。
+        self._ensure_episode_info()
+
         # episode 间释放上一幕（首个 episode 无上一幕）。close_env 内部 self.close() 为 no-op，
         # 真正作用是 clear_cache=True 时的 sapien_clear_cache（对齐 eval_policy 的 clear_cache_freq）。
         if self._ep_count > 0:
@@ -201,7 +207,9 @@ class RoboTwinEnv:
         # 如 stack_blocks_two=800 个 take_action）；缺失（eval_mode=False）才回退 max_decision_steps。
         self._step_budget = int(getattr(self.env, "step_lim", None) or self.max_decision_steps)
 
-        self._instruction = self._resolve_instruction()
+        # RLinf 对齐：每集从缓存 episode_info 随机生成模板指令（与 eval_policy_client 同源），
+        # 而非固定 fallback "stack the two blocks"——否则语言条件与训练/eval 不符 → rollout 必失败。
+        self._instruction = self._create_instruction()
         self.env.set_instruction(instruction=self._instruction)
         self._steps_since_reset = 0
         self._success_once = False
@@ -266,6 +274,64 @@ class RoboTwinEnv:
     @property
     def steps_since_reset(self) -> int:
         return self._steps_since_reset
+
+    def _ensure_episode_info(self) -> None:
+        """RLinf 对齐：一次性获取并缓存 RoboTwin episode_info（占位符 {A}/{B}/{a}/{b}）。
+
+        RLinf 用 `task.get_info()`（廉价、不动机器人）；本仓 RoboTwin **没有 get_info**，
+        info["info"] 只在 `play_once` 里填，故启动时跑一次专家 play_once 取之（仅一次，之后复用——
+        与 RLinf「episode_info 只取一次」一致）。play_once 需 curobo（gate-4 的 eval_policy_client 同样用它）。
+        失败则 self._episode_info={}，每集指令降级到 fallback（不再重试）。
+        """
+        if self._episode_info is not None:
+            return
+        try:
+            from envs.utils.create_actor import UnStableError
+        except Exception:
+            UnStableError = ()
+        for k in range(self._max_reset_retries):
+            seed = self._seed + k
+            try:
+                self.env.setup_demo(now_ep_num=0, seed=seed, is_test=True, **self._setup_kwargs)
+                info = self.env.play_once()                       # 填 self.env.info["info"]
+                got = info.get("info") if isinstance(info, dict) else None
+                self._episode_info = dict(got) if got else dict(
+                    (getattr(self.env, "info", {}) or {}).get("info", {}) or {})
+            except UnStableError:
+                self._episode_info = None
+            except Exception:
+                logging.exception("[RoboTwin] play_once for episode_info failed at seed=%d", seed)
+                self._episode_info = None
+            try:
+                self.env.close_env(clear_cache=False)
+            except Exception:
+                pass
+            if self._episode_info:
+                logging.info("[RoboTwin] cached episode_info for instructions: %s", self._episode_info)
+                return
+        self._episode_info = {}    # 已尝试但失败：标记避免每集重试，指令走 fallback
+        logging.warning("[RoboTwin] could not capture episode_info; instructions fall back to '%s'",
+                        self._lang_fallback)
+
+    def _create_instruction(self) -> str:
+        """RLinf 对齐（vector_env.py:117 create_instruction）：用缓存 episode_info 经
+        `generate_episode_descriptions` 生成模板指令，每集 `np.random.choice` 随机选一条。
+        生成函数在 RoboTwin/description/utils（cwd=robotwin_root，见 run_robotwin_client 的 os.chdir）。
+        """
+        if not self._episode_info:
+            return self._resolve_instruction()
+        try:
+            import sys
+            if "./description/utils" not in sys.path:
+                sys.path.append("./description/utils")
+            from generate_episode_instructions import generate_episode_descriptions
+            results = generate_episode_descriptions(self.task_name, [self._episode_info], 100)
+            pool = results[0].get(self.instruction_type) or results[0].get("seen") or []
+            if len(pool) > 0:
+                return str(np.random.choice(pool))
+        except Exception:
+            logging.exception("[RoboTwin] generate_episode_descriptions failed; using fallback instruction")
+        return self._resolve_instruction()
 
     def _resolve_instruction(self) -> str:
         try:

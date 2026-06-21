@@ -397,6 +397,9 @@ class Pi05Agent(Model):
         # only the shape must flow through the transforms). DROID repacks "actions" and ignores this
         # extra key, so existing DROID/EXPO behavior is unchanged (zero-intrusion, additive only).
         raw_observations["action"] = np.zeros((self.model_config.action_horizon, action_dim))
+        # robotwin/aloha repack 现含 "prompt"（见 build_pi05_config）：env obs 通常已带真实 instruction；
+        # 这里兜底，避免无 prompt 的输入（如测试/DBPO）触发 repack KeyError。有真实 prompt 时不覆盖。
+        raw_observations.setdefault("prompt", self.default_prompt if self.default_prompt is not None else "")
         for key, value in raw_observations.items():
             raw_observations[key] = np.asarray(value)
             if "image" in key:
