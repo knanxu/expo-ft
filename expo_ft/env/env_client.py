@@ -144,7 +144,7 @@ class EnvClient:
         """Step a whole action chunk with SpeedTune speed control.
 
         Returns (executed_action, info) where info has n_exec_steps / duration / exec_status.
-        New op; the per-action ``step`` above is untouched (EXPO/DBPO paths unchanged).
+        New op; the per-action ``step`` above is untouched (EXPO path unchanged).
         """
         response = self._call_operation("step_chunk", {
             "env_id": env_id, "chunk": np.asarray(chunk),

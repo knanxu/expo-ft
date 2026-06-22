@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 """SpeedTune 加速模块训练入口（branching Rainbow-DQN，冻结 VLA 之上，两阶段解耦）。
 
-与 `train_pi_robo_async.py` / `train_pi_robo_dbpo_async.py` 同构的 async 双线程：
+与 `train_pi_robo_async.py` 同构的 async 双线程：
   - **actor 主线程**：每个决策步（= 一整段 chunk）跑 ① 冻结 VLA 前向得 (action_chunk, suffix_feat)；
     ② DQN 读 detached suffix_feat 选速度档（epsilon-greedy）；③ decode 成 speed_params；
     ④ `env.step_chunk(real_chunk, speed_params, exec_backend)` 整段执行；⑤ 攒 episode transitions。
@@ -9,7 +9,7 @@
     失败全 0 → 最严格的防 reward hacking），再写入共享 replay buffer。
   - **learner 后台线程**：buffer 攒够后采样 → DQN.update（double+dueling+C51+n-step+PER）→ 发布 q 参数。
 
-**零侵入**：VLA 全程冻结（只前向、不进优化器）；不改 EXPO/BC/DBPO 任何代码路径。env 经
+**零侵入**：VLA 全程冻结（只前向、不进优化器）；不改 EXPO/BC 任何代码路径。env 经
 `client_robotwin/` 的新增 `step_chunk` 协议（per-action `step` 不受影响）。
 
 复用：`build_pi05`（加载冻结 drift VLA）、`make_drift_apply_fn`（一次前向得 mean+value_feat）、
@@ -70,7 +70,7 @@ def _setup_speedtune(config, config_task, seed, mesh, shardings, env):
       dict(actor, drift_forward, unnormalize, preprocess, dqn, buffer, backend, feat_dim)。
     """
     from expo_ft.agents.vla.pi05 import build_pi05
-    from expo_ft.agents.alg.dbpo_pi05 import make_drift_apply_fn
+    from expo_ft.agents.vla.drift_adapters import make_drift_apply_fn
 
     data_sharding, replicated_sharding = shardings
     n_real_dims = int(config.n_real_dims)

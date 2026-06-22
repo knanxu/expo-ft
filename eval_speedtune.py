@@ -64,7 +64,7 @@ config_flags.DEFINE_config_file(
 def _build_eval(config, config_task, seed, mesh, shardings, env):
     """加载冻结 VLA + drift 前向/反归一化 + exec_backend + DQN（结构同 train 的 _setup_speedtune）。"""
     from expo_ft.agents.vla.pi05 import build_pi05
-    from expo_ft.agents.alg.dbpo_pi05 import make_drift_apply_fn
+    from expo_ft.agents.vla.drift_adapters import make_drift_apply_fn
 
     data_sharding, replicated_sharding = shardings
     n_real_dims = int(config.n_real_dims)

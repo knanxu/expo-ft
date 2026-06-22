@@ -62,7 +62,7 @@ def _episode_instruction(ep_file, instruction_type, fallback):
     """读该 episode 的真实指令（RoboTwin 把每集指令存在 data/ 的 sibling
     `instructions/episode{N}.json`，含 {"seen":[...], "unseen":[...]}），随机选一条 instruction_type 模板。
     与在线 rollout（RoboTwinEnv._create_instruction）/ DBP 训练同分布——而非固定的 task language_instruction，
-    否则离线 demo 的 prompt 与策略期望不符（详见 docs/DBPO_DEV.md 的 instruction 接缝）。缺失则回退 fallback。
+    否则离线 demo 的 prompt 与策略期望不符。缺失则回退 fallback。
     """
     stem = os.path.splitext(os.path.basename(ep_file))[0]                # episode{N}
     # ep_file = <config>/data/episode{N}.hdf5 → <config>/instructions/episode{N}.json

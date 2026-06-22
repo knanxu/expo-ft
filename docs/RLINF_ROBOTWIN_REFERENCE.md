@@ -1,7 +1,7 @@
-# RLinf 在 RoboTwin 上做 VLA-RL 的实现剖析（DBPO 参考）
+# RLinf 在 RoboTwin 上做 VLA-RL 的实现剖析（VLA-RL 参考）
 
-> 目标：拆解 RLinf（`/home/xukainan/RLinf`）如何在 RoboTwin 双臂仿真上对 pi0.5 做 on-policy RL（PPO/BPO），
-> 提炼可被我们 DBPO×EXPO-FT(JAX) 直接借鉴的部分。所有结论均引用 RLinf 实际源码（文件:行）。
+> 目标：拆解 RLinf（`/home/xukainan/RLinf`）如何在 RoboTwin 双臂仿真上对 pi0.5 做 on-policy RL（PPO），
+> 提炼可被本项目 drift pi0.5 RL（JAX）直接借鉴的部分。所有结论均引用 RLinf 实际源码（文件:行）。
 > 剖析日期：2026-06-18。样例 config：`examples/embodiment/config/robotwin_adjust_bottle_ppo_openpi_pi05.yaml`。
 
 ---
@@ -12,13 +12,12 @@ RLinf = **PyTorch/FSDP + Ray** 的分布式 actor–rollout–env 三组件框�
 做 **chunk 级 macro-action 的 PPO**：双臂 chunk **整段 50 步执行**，reward/logprob/GAE 全在**决策步（chunk）粒度**，
 稀疏 0/1 终局奖励。
 
-> ⚠️ 归因更正：本地 RLinf 里的 BPO/DBPO 代码（`losses_bpo.py`、`openpi_dbpo_action_model.py`）是 **polar823 自己加的**，
-> **不是** RLinf 原生。真正可参考的是 RLinf 原生的 **① RoboTwin 适配**（§2）、**② PPO 的 critic head 设计 + actor/critic 冻结策略**（§4）、
+> ⚠️ 归因说明：RLinf **原生只有 PPO**；本地 RLinf 里看到的 BPO 等变体是外部自加的、并非 RLinf 原生，本项目不再使用。
+> 真正可参考的是 RLinf 原生的 **① RoboTwin 适配**（§2）、**② PPO 的 critic head 设计 + actor/critic 冻结策略**（§4）、
 > **③ chunk 级 macro-action MDP**（§3）。
 
-与我们 DBPO 的**关键差异**（RLinf 原生 PPO 侧）：① RLinf 用 flow-matching（多步去噪）+ 固定探索噪声 `noise_level=0.3`，
-我们用 **drift 单步 + 学习的 state-conditioned log-std 头**；② RLinf **整段执行 H_e=50**，我们倾向 **H_e 更短的前缀**；
-③ DBPO 特有的 anchor 正则、BPO surrogate 是我们/你自加的增量，需自行保留。
+与本项目 drift pi0.5 RL 的**关键差异**（RLinf 原生 PPO 侧）：① RLinf 用 flow-matching（多步去噪）+ 固定探索噪声 `noise_level=0.3`，
+我们用 **drift 单步 + 学习的 state-conditioned log-std 头**；② RLinf **整段执行 H_e=50**，我们倾向 **H_e 更短的前缀**。
 
 ---
 
@@ -37,7 +36,7 @@ RLinf = **PyTorch/FSDP + Ray** 的分布式 actor–rollout–env 三组件框�
 | `algorithm.logprob_type` | **chunk_level** | ratio = 对 50×14=700 个 log-prob 求和后的**单标量**/决策步 |
 | `algorithm.entropy_type` | token_level | entropy 逐 token |
 | `algorithm.adv_type` / `gamma` / `gae_lambda` | gae / 0.99 / 0.95 | **决策步粒度 GAE** |
-| `clip_ratio_high/low` / `value_clip` | 0.2 / 0.2 | PPO clip（BPO 时 `bpo_epsilon` 同档）|
+| `clip_ratio_high/low` / `value_clip` | 0.2 / 0.2 | PPO clip ratio |
 | `rollout_epoch` / `update_epoch` | 4 / 5 | 每轮采 4、每批更新 5 个 epoch |
 | `env.train.total_num_envs` | **256** | 256 个并行 env（吞吐靠大规模并行）|
 | `env.train.max_episode_steps` / `max_steps_per_rollout_epoch` | 200 / 200 | 每 episode 200 env-step |
@@ -85,7 +84,7 @@ RLinf = **PyTorch/FSDP + Ray** 的分布式 actor–rollout–env 三组件框�
 - **value**：每决策步一个 `V(o_t)`，detached 输入；critic 用 PPO Huber + value-clip。
 
 > 这套「reward 子步求和 → 每决策步标量 reward + 一个 V → 决策步 GAE → chunk_level 单标量 ratio」
-> **与我们 DBPO 的 RolloutBuffer/GAE 设计完全同构**，可作为正确性对照。
+> **与 on-policy RL 的标准 rollout buffer / GAE 设计同构**，可作为正确性对照。
 
 ---
 
@@ -119,31 +118,31 @@ value = self.value_head(suffix_out_value)[:, 0]              # ValueHead: MLP(10
 - `freeze_vision_encoder` 同理管 SigLIP；`trainable_experts` 控制哪些 expert 可训。
 - 比 4.1 重，但 value 表征更独立。你 config 用的是 4.1 轻量方案，不是这个。
 
-### 4.4 落到我们 DBPO×EXPO-FT(JAX) 的结论
+### 4.4 落到本项目 drift pi0.5 RL（JAX）的结论
 **问：训 critic / actor 时要不要冻结上层 VLM？**
-1. **critic 侧**：不需要单独把 VLM 设成不可训——只要在 value head **输入处 `jax.lax.stop_gradient`**（= RLinf 的 `detach_critic_input=True`）。这样 value loss 只更新 value head，不动 backbone。你的 `dbpo_heads.ValueHead` 已是独立 head，补一个 stop_gradient 即可。
-   - 若 value 读 **`cond_emb`（VLM prefix 池化，纯 obs）**且 VLM 已被 `trainable_filter` 冻结 → 梯度本就到不了可训参数，detach 与否对 VLM 无影响；但若 value 改读 **`suffix_feat`（action expert 输出，可训，actor 也在训它）→ 必须 stop_gradient**，否则 value loss 干扰 actor（这正是 RLinf detach 的理由）。
-   - 论文 DBPO 说 value 只输入 obs → 选 `cond_emb` 更贴论文；RLinf 选 `suffix_out`（含 action 上下文）+ detach。可 A/B。
-2. **actor 侧**：是否冻结 VLM 是**独立问题**，由 `trainable_filter`/LoRA 决定（你已冻结 VLM/SigLIP 只训 action expert + 投影）。与 critic 无关。
-3. **一次前向出 mean+value**（4.1 共享 suffix）比独立 value expert 省算力，推荐先用共享方案 + stop_gradient。anchor 仍用冻结 Stage-1 drift 参数，属 actor 侧正则，与上述冻结无关。
+1. **critic 侧**：不需要单独把 VLM 设成不可训——只要在 value/critic head **输入处 `jax.lax.stop_gradient`**（= RLinf 的 `detach_critic_input=True`，如 speedtune 的 `rainbow_dqn` 的 `detach_input`）。这样 value loss 只更新 head 自己，不动 backbone。head 本就是独立模块时，补一个输入处 stop_gradient 即可。
+   - 若 head 读 **`cond_emb`（VLM prefix 池化，纯 obs）**且 VLM 已被 `trainable_filter` 冻结 → 梯度本就到不了可训参数，detach 与否对 VLM 无影响；但若 head 改读 **`suffix_feat`（action expert 输出，可训，actor 也在训它）→ 必须 stop_gradient**，否则 critic loss 干扰 actor（这正是 RLinf detach 的理由）。
+   - 若希望 value 只输入 obs → 选 `cond_emb` 更贴该取向；RLinf 选 `suffix_out`（含 action 上下文）+ detach。可 A/B。
+2. **actor 侧**：是否冻结 VLM 是**独立问题**，由 `trainable_filter`/LoRA 决定（已冻结 VLM/SigLIP 只训 action expert + 投影）。与 critic 无关。
+3. **一次前向出 mean+value**（4.1 共享 suffix）比独立 value expert 省算力，推荐先用共享方案 + stop_gradient。
 
 ---
 
-## 5. 可直接借鉴到 DBPO×EXPO-FT(JAX) 的清单
+## 5. 可直接借鉴到本项目 drift pi0.5 RL（JAX）的清单
 
 | 借鉴点 | RLinf 出处 | 用法 |
 |---|---|---|
 | **critic head 与 action head 同级 + detach** | `openpi_action_model.py:875` + `value_head.py` | value head 挂 backbone 输出、与 action 头平级；输入 `stop_gradient`（=`detach_critic_input`）隔离 critic 梯度（见 §4）|
-| **chunk_level macro-action MDP** | `utils.py:79/335` + `advantages.py:25` | 印证我们 RolloutBuffer：reward 子步求和→每决策步标量+一个 V→决策步 GAE→单标量 ratio |
-| **chunk_level ratio 数值风险** | `utils.py:335`（700 维求和单标量）| 印证 H×14 维 ratio 易失稳 → 我们用短 H_e 前缀 / ratio clamp 应对（注：clamp 已在你自加的 BPO 代码里）|
-| **logprob 粒度旋钮** | `utils.py:310/324/335` | DBPO 数学是 chunk_level；若 ratio 太脆可借鉴 `action_level`（对 14 维求和/步）做更稳的变体实验 |
-| **RoboTwin env 适配模板** | `robotwin_env.py` 全文 | 我们写 `client/envs/robotwin_env.py` 时照搬：VectorEnv 并行、chunk 整段/逐 action、稀疏终局 reward、success_seeds reset、auto_reset、eval success_at_end |
-| **TOPPRA/速度执行接口** | `robotwin_env.py:392 chunk_step_with_speed` + `venv.step_with_speed` | 对应你的"方式1 整段 TOPPRA"；可参考其 `(v,vel_scale,acc_scale)` 元动作接口 |
-| **value 头 detach 输入** | config `detach_critic_input:True` + `add_value_head` | 与我们 value-on-obs、stop-grad 一致 |
-| **超参对照** | config `algorithm.*` | gamma0.99/λ0.95/clip0.2/bpo_λ1e-3/actor_lr5e-6/value_lr1e-4/update_epoch5/rollout_epoch4 |
+| **chunk_level macro-action MDP** | `utils.py:79/335` + `advantages.py:25` | on-policy RL 标准 rollout buffer 对照：reward 子步求和→每决策步标量+一个 V→决策步 GAE→单标量 ratio |
+| **chunk_level ratio 数值风险** | `utils.py:335`（700 维求和单标量）| H×14 维 ratio 易失稳 → 用短 H_e 前缀 / ratio clamp 应对 |
+| **logprob 粒度旋钮** | `utils.py:310/324/335` | 若 chunk_level ratio 太脆可借鉴 `action_level`（对 14 维求和/步）做更稳的变体实验 |
+| **RoboTwin env 适配模板** | `robotwin_env.py` 全文 | 写 RoboTwin env 适配时可照搬：VectorEnv 并行、chunk 整段/逐 action、稀疏终局 reward、success_seeds reset、auto_reset、eval success_at_end |
+| **TOPPRA/速度执行接口** | `robotwin_env.py:392 chunk_step_with_speed` + `venv.step_with_speed` | 对应"整段 TOPPRA + 速度元动作"执行方式；可参考其 `(v,vel_scale,acc_scale)` 元动作接口（与 speedtune 相关）|
+| **value 头 detach 输入** | config `detach_critic_input:True` + `add_value_head` | 与 value-on-obs、stop-grad 设计一致 |
+| **超参对照** | config `algorithm.*` | gamma0.99/λ0.95/clip0.2/actor_lr5e-6/value_lr1e-4/update_epoch5/rollout_epoch4 |
 
 **不照搬/需注意**：
-- RLinf 是 **flow-matching(5步) + 固定 noise 0.3**；我们是 **drift 单步 + 学习 log-std 头** → logprob/采样机制不同，BPO/GAE/buffer 可复用，stochastic adapter 要保留 DBPO 自己的（state-conditioned log-std）。
+- RLinf 是 **flow-matching(5步) + 固定 noise 0.3**；我们是 **drift 单步 + 学习 log-std 头** → logprob/采样机制不同，GAE/buffer 机制可复用，stochastic adapter 走我们自己的 state-conditioned log-std。
 - RLinf 靠 **256 并行 env** 喂数据；我们 RoboTwin 若并行度低，样本效率会是瓶颈（D8 开放问题）。
 - RLinf **整段执行 H_e=50 + clamp**；我们仍倾向 **H_e 短前缀**（红线：H_e == env 实际执行步），二者可 A/B：要么"短 H_e"要么"长 H_e + ratio clamp"。
 
@@ -155,5 +154,5 @@ value = self.value_head(suffix_out_value)[:, 0]              # ValueHead: MLP(10
 - env worker（rollout 交互）：`rlinf/workers/env/env_worker.py`（`env_interact_step:381`、`n_train_chunk_steps:104`）
 - chunk_level reward/logprob：`rlinf/algorithms/utils.py`（reward `:79`、logprob `:335`）
 - GAE：`rlinf/algorithms/advantages.py:25`
-- **BPO loss**：`rlinf/algorithms/losses_bpo.py`
+- **PPO loss（actor/critic，RLinf 原生）**：`rlinf/algorithms/losses.py`（`compute_ppo_actor_loss:167`、`compute_ppo_critic_loss:312`）
 - actor 优势/更新：`rlinf/workers/actor/async_ppo_fsdp_worker.py`（`compute_advantages_and_returns:64`）

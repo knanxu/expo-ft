@@ -1,12 +1,12 @@
 """Config for SpeedTuneLearner: branching Rainbow-DQN 加速模块（冻结 VLA 之上，两阶段解耦）。
 
-零侵入增量（与 EXPO/BC/DBPO config 平级，不改它们）。三种执行方式用**同一份 config**、
+零侵入增量（与 EXPO/BC config 平级，不改它们）。三种执行方式用**同一份 config**、
 靠 ``exec_backend`` 切换（三个独立 run）：
 
     python train_speedtune_async.py --config configs/model/speedtune_dqn_config.py \
         --config.exec_backend per_action_toppra ...
 
-VLA 字段复用 dbpo_pi_config 的 pi0.5 加载约定；但 VLA **全程冻结**（不训），故无
+VLA 字段复用 expo_ft_pi_drift_config 的 pi0.5 加载约定；但 VLA **全程冻结**（不训），故无
 ``actor_trainable_regex``。动作空间/reward 的 grid·α·β 见
 ``expo_ft/speedtune/exec_backends.py``（默认已通过防-reward-hacking 验证）。
 """

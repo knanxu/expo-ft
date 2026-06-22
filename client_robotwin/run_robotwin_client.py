@@ -1,4 +1,4 @@
-"""RoboTwin rollout server for DBPO×EXPO-FT online RL.
+"""RoboTwin rollout server for EXPO-FT online RL.
 
 与 `client/run_client.py` **完全相同的 websocket 协议**（create_env / reset / step /
 get_observation / get_info_for_step，msgpack_numpy），learner 端 `env_client` 不变。

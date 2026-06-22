@@ -1,9 +1,9 @@
 # 双臂 / 长程 机器人 RL 的 action horizon 与执行步数调研
 
-> 调研动机：DBPO 与 EXPO-FT 都用**单臂、短程**机器人，action chunk 很短（DBPO 仿真 H≤16/H_e≤8，
-> robomimic 档 H=H_e=4；EXPO-FT `replan_steps=8`）。但本项目在 **RoboTwin 用双臂机器人**，
+> 调研动机：多数单臂 RL 方法（如 EXPO-FT `replan_steps=8`；DPPO/DBPO 类工作仿真 H≤16/H_e≤8、
+> robomimic 档 H=H_e=4）都在**单臂、短程**机器人上、action chunk 很短。但本项目在 **RoboTwin 用双臂机器人**，
 > pi0.5 默认 `action_horizon=50`。本表回答：**双臂 / 长程 RL（含真机）项目实际用多大的预测 horizon H
-> 和执行步数 H_e**，以对标我们 DBPO×pi0.5 双臂的取值。
+> 和执行步数 H_e**，以对标本项目的 drift pi0.5 双臂 RL 的取值。
 >
 > 所有数值均经 **GitHub 实际代码/配置文件**核对（标注来源文件:字段）；未能核对者标 `unconfirmed`。
 > 诚实区分**真机 / 仿真**。调研日期：2026-06-17。
@@ -61,9 +61,9 @@
 ## 综合结论
 
 ### 1. 双臂 backbone 的预测 horizon H 普遍是 50–100
-- Flow VLA **pi0 / pi0.5**：双臂 ALOHA / RoboTwin 一律 **H=50**（`Pi0Config.action_horizon` 默认；单臂 DROID 才降到 10–15）。**这就是你 RoboTwin 双臂 H=50 的来源，且与同类双臂部署一致——50 不是异常值，是双臂标准档。**
+- Flow VLA **pi0 / pi0.5**：双臂 ALOHA / RoboTwin 一律 **H=50**（`Pi0Config.action_horizon` 默认；单臂 DROID 才降到 10–15）。**这就是本项目 RoboTwin 双臂 H=50 的来源，且与同类双臂部署一致——50 不是异常值，是双臂标准档。**
 - Diffusion **RDT-1B**：H=64。ACT/ALOHA：H=100（RoboTwin-ACT 仿真用 50）。
-- 对照：单臂 DBPO/EXPO/DROID 的 4–16 明显更短——horizon 随机器人自由度与任务时长增长，符合直觉。
+- 对照：单臂方法（DPPO/EXPO/DROID 等）的 4–16 明显更短——horizon 随机器人自由度与任务时长增长，符合直觉。
 
 ### 2. 执行步数 H_e 有三种主流做法
 - **整段开环 H_e=H**：RoboTwin 全家(pi0=50 / ACT=50 / RDT=64)、RDT-1B 真机(64)、OpenVLA-OFT / **SimpleVLA-RL**（chunk 内不重规划）、DPPO/QC 仿真。吞吐高。
@@ -75,22 +75,22 @@
 - **双臂真机 RL 的唯一完整公开代码 = HIL-SERL** 的 object_handover，但它 **H=H_e=1、无 chunk、短程**。
 - **残差类**（ResiP 真机 / ResFiT 论文双臂）把多步 chunk 留在**冻结 BC 底座**，RL 残差本身逐步（H_e=1）。
 - **SimpleVLA-RL 的真机长程 RL（2026-01，~300% 提升）** 是目前最接近"双臂+长程+chunk 真机 RL"的工作，但细节（臂数、H、是否真双臂）尚未公开。
-- ⇒ **你的 DBPO×drift-pi0.5 做双臂 / 长程 / 多步 chunk 执行的真机 RL，正落在该表尚无人占据的空白点。** 先在 RoboTwin 仿真跑通是合理路径。
+- ⇒ **本项目的 drift pi0.5 双臂 RL（双臂 / 长程 / 多步 chunk 执行的真机 RL），正落在该表尚无人占据的空白点。** 先在 RoboTwin 仿真跑通是合理路径。
 
 ### 4. 对本项目 H / H_e 取值的对标建议
 
-> ⚠️ **决策更新（2026-06-18，以此为准）**：下表是调研期的对标建议；用户已最终决定 **DBPO rollout 执行整段 chunk
+> ⚠️ **决策更新（2026-06-18，以此为准）**：下表是调研期的对标建议；后续已决定本项目 on-policy rollout **执行整段 chunk
 > `H_e = H = 50`（对齐 RLinf，不部分执行）**，EXPO-FT 原算法保留部分执行。本表的"起步 H_e=8 / 前缀"建议**已被覆盖**，
-> 仅留作对标参考。残留项：整段 700 维 ratio 易爆 → 监控后按需加 ratio clamp。详见 `docs/ROBOTWIN_ADAPTATION_PLAN.md` §1/§D1。
+> 仅留作对标参考。残留项：整段执行时 700 维 joint ratio 易爆 → 监控后按需加 ratio clamp。
 
 | | 取值 | 依据 |
 |---|---|---|
 | **预测 H** | **50** | pi0/pi0.5 双臂默认；RoboTwin/openpi/RDT 同档，无需改 |
-| **执行/credit H_e（起步）** | **8–25** | DBPO 同源 DPPO 用整段 4–8；DBPO repo 最大 H_e=8；而双臂 receding-horizon 事实基准是 **25**（openpi 真机 ALOHA + OpenVLA-OFT ALOHA）。折中：DBPO 的 joint-Gaussian ratio 对维度敏感 → **起步 H_e=8（贴 DBPO/DPPO），稳定后向双臂基准 25 靠拢**；上限不超过整段 50 |
-| **执行整段 vs 前缀** | **前缀(receding-horizon)** | 既是 openpi 真机双臂做法(50→25)，也利于 DBPO ratio 稳定；整段 50（RoboTwin/SimpleVLA-RL 风格）对 DBPO 单标量 ratio 风险最大 |
+| **执行/credit H_e（起步）** | **8–25** | DPPO（含同源 DBPO repo）用整段 4–8、最大 H_e=8；而双臂 receding-horizon 事实基准是 **25**（openpi 真机 ALOHA + OpenVLA-OFT ALOHA）。折中：joint-Gaussian likelihood ratio 对维度敏感 → **起步 H_e=8（贴 DPPO/DBPO 等短 chunk 方法），稳定后向双臂基准 25 靠拢**；上限不超过整段 50 |
+| **执行整段 vs 前缀** | **前缀(receding-horizon)** | 既是 openpi 真机双臂做法(50→25)，也利于 likelihood ratio 稳定；整段 50（RoboTwin/SimpleVLA-RL 风格）对单标量 joint ratio 风险最大 |
 
 > 红线复述（见 CLAUDE.md）：**H_e（RL credit 的执行步数）必须 == env 实际执行/replan 步数**（RoboTwin `pi0_step`）。
-> 选 H_e=8 就把 `pi0_step` 也设 8，并在该 replan 间隔下重新 greedy 评 DBP baseline。
+> 选 H_e=8 就把 `pi0_step` 也设 8，并在该 replan 间隔下重新评估基线策略的表现。
 
 ---
 

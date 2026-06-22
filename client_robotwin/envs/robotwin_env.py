@@ -1,4 +1,4 @@
-"""RoboTwin env adapter for DBPO×EXPO-FT online RL (双臂 aloha-agilex 仿真).
+"""RoboTwin env adapter for EXPO-FT online RL (双臂 aloha-agilex 仿真).
 
 镜像 `client/envs/droid_env.py` 的接口（reset / get_observation / step(action)→{executed_action}
 / get_info_for_step()→(done, success, reward, mask)），把已改造的 RoboTwin 任务 env 包成

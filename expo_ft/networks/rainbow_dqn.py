@@ -10,7 +10,7 @@
     ``A_i(s,a)`` ``[B, Nᵢ, n_atoms]``，组合 ``logits = V + A - mean_a A``。
   - NoisyNet 暂未实现（计划：可选、后置）；探索用 epsilon-greedy（在 learner 端）。
 
-输入特征默认 ``stop_gradient``（``detach_input``，与 ``dbpo_heads.ValueHead`` 同惯例）：
+输入特征默认 ``stop_gradient``（``detach_input``）：
 SpeedTune 两阶段解耦，VLA 冻结，DQN 梯度绝不回灌 action expert。
 """
 

@@ -1,6 +1,6 @@
 """SpeedTuneLearner: branching Rainbow-DQN on a frozen VLA's suffix features.
 
-两阶段解耦的加速模块（与 EXPO/BC/DBPO 平级，零侵入）。VLA 冻结，``suffix_feat``
+两阶段解耦的加速模块（与 EXPO/BC 平级，零侵入）。VLA 冻结，``suffix_feat``
 （mean-pooled action-expert 特征）在 rollout 时算好并缓存进 ``SpeedTuneReplayBuffer``，
 所以本 learner 是**纯 DQN**——不在 ``update`` 里重跑 3B VLA 前向，只对 Q 网络求梯度。
 

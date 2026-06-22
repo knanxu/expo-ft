@@ -11,7 +11,7 @@
     RepackTransform/Normalize），replay buffer 的 3 路图像槽 base+left/right_wrist 对上 aloha 三相机；
     EXPO `sample_actions`(:532) 已含 `process_transformed_outputs` 反归一化。
 
-配套（算法无关，EXPO/DBPO 共用）：`configs/task/robotwin_stack_blocks.py`（env_type="sim"）。
+配套（算法无关，EXPO/speedtune 共用）：`configs/task/robotwin_stack_blocks.py`（env_type="sim"）。
 训练入口直接复用现成 `train_pi_robo_async.py`（`EXPOLearner` 分支），无需新入口。
 """
 
@@ -81,6 +81,6 @@ def get_config():
     # **首跑用 replan_steps=8**：EXPO 里 Q/residual 维度 = replan_steps × action_dim(14)：
     #   8→112 维（可控），25→350 维（≈DROID 56 的 6×，单 env 下 SAC residual+Q 难收敛）。
     # 25/50 控制比例虽与 DROID 8/16 同（50%），但 8 给更多决策点(800/8≈100)与更密 critic 信号；
-    # 基线学起来后再逐步加大。（DBPO 用 25 更合适：normalize_dims 归一化、无高维 Q。）
+    # 基线学起来后再逐步加大。
 
     return config
