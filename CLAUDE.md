@@ -6,6 +6,12 @@
 > 以 **RoboTwin 仿真**（stack two blocks，双臂 aloha-agilex）作为首个跑通验证环境，后续再迁真机。
 > 维护人：polar823。
 
+> **运行环境（重要）**：所有训练 / rollout / eval **均在云端服务器**完成（见 `scripts/run_speedtune_*.sh`
+> 里 `EXPO_ROOT=/home/chenlu/...`、`SPEEDTUNE_VLA_CKPT` 等环境变量）；**本仓库本地只提供代码**。
+> 因此本地 **没有** `logs/`、wandb 记录、模型 checkpoint、norm_stats、RoboTwin demo 数据，也**跑不了**训练/仿真。
+> 调试时不要假设本地能复现实验或读到训练产物——需要运行结果 / 实际超参 / success 曲线时，**问维护人**（或让其在云端取），
+> 不要从本地空目录推断"未配置"。本地 `/home/xukainan/RoboTwin` 仅供**读代码对照**（fork 自 knanxu/RoboTwin）。
+
 > **当前主线**：让 EXPO-FT 原算法（`EXPOLearner`/`BCLearner`）在 drift pi0.5 + RoboTwin 上跑通。
 > drift 对 EXPO-FT 是**纯 config 切换**——合并后的 `pi0.py` 里 `sample_actions`/`compute_loss` 已按
 > `use_drifting_loss` 自动分发到 drift，EXPO 的采样（`_jitted_infer`）与 actor 更新（`train_step`）天然吃到，
