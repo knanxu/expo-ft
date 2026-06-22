@@ -40,6 +40,12 @@ def get_config():
     config.n_real_dims = 14                   # 双臂 2×(6关节+1夹爪)
     config.max_decision_steps = 200           # 每 episode 最多 env-step（对齐 RLinf max_episode_steps）
     config.seed = 0
+    # 自动专家介入（替代人类在环，打破 EXPO rollout 0% 死锁；EXPO/BC 通用，零侵入）。
+    # 用到 takeover_step_frac 比例 step 预算仍未 success → 从当前状态录 play_once 专家带逐 step 回放
+    # （action_type="human"，复用 learner is_hil 通路）。takeover_enable=False 退化为纯 offline-demo 行为。
+    config.takeover_enable = True
+    config.takeover_step_frac = 0.5     # 用到 50% 预算仍未成功即接管
+    config.takeover_save_freq = 15      # 录播采样率（物理步），对齐 offline demo / streaming 节奏
     # RLinf 对齐：每集随机模板指令的池（"seen"/"unseen"）。env 与离线 loader 都读它。
     # ⚠️ 务必与你 gate-4 eval（eval_policy_client 的 --instruction_type）一致，否则语言分布不符。
     config.instruction_type = "seen"

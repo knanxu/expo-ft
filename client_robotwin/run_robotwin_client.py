@@ -106,12 +106,16 @@ async def _handle_environment_request(websocket: _server.ServerConnection):
                         # invalid sentinel（全 -1）跳过执行，同 run_client。
                         if np.allclose(sent_action, -1.0):
                             executed_action = sent_action
+                            action_type = "policy"
                         else:
-                            executed_action = np.array(env.step(sent_action)["executed_action"], dtype=np.float64)
+                            result = env.step(sent_action)
+                            executed_action = np.array(result["executed_action"], dtype=np.float64)
+                            action_type = result.get("action_type", "policy")
                         response = {
                             "status": "success",
                             "action": executed_action.tolist(),
-                            "action_type": "policy",   # RoboTwin 仿真无 human override
+                            # 接管期 RoboTwinEnv 返回 "human"，复用 learner is_hil 通路（DROID 同协议）。
+                            "action_type": action_type,
                         }
                     await websocket.send(packer.pack(response))
 

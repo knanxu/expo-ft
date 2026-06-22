@@ -8,7 +8,10 @@
 
 > **运行环境（重要）**：所有训练 / rollout / eval **均在云端服务器**完成（见 `scripts/run_speedtune_*.sh`
 > 里 `EXPO_ROOT=/home/chenlu/...`、`SPEEDTUNE_VLA_CKPT` 等环境变量）；**本仓库本地只提供代码**。
-> 因此本地 **没有** `logs/`、wandb 记录、模型 checkpoint、norm_stats、RoboTwin demo 数据，也**跑不了**训练/仿真。
+> 因此本地 **没有** `logs/`、wandb 记录、模型 checkpoint、norm_stats、RoboTwin demo 数据，也**跑不了**训练/仿真/**测试**
+> （**显存不足**——连 `pytest`、`import jax/sapien/torch` 都不要在本地执行）。
+> **工作流 = Claude 本地写代码 → 维护人上传云端服务器 → 云端调脚本跑训练/测试**；Claude 本地只做**静态检查**
+> （`ast.parse` 语法、逻辑 review；`*_test.py` 照写但**不本地执行**），所有 `pytest`/训练/rollout/eval 验证交云端。
 > 调试时不要假设本地能复现实验或读到训练产物——需要运行结果 / 实际超参 / success 曲线时，**问维护人**（或让其在云端取），
 > 不要从本地空目录推断"未配置"。本地 `/home/xukainan/RoboTwin` 仅供**读代码对照**（fork 自 knanxu/RoboTwin）。
 

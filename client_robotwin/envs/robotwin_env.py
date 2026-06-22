@@ -29,6 +29,12 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import yaml
 
+from client_robotwin.envs.expert_takeover import (
+    should_takeover,
+    record_expert_tape,
+    TapeReplayer,
+)
+
 
 class RoboTwinEnv:
     """Wrap one RoboTwin task env with the EXPO-FT env-server interface."""
@@ -61,6 +67,14 @@ class RoboTwinEnv:
         _ks = kwargs.get("k_skip", None)
         self._k_skip = int(_ks) if _ks not in (None, "", 0) else None
         self._eval_vsf = int(kwargs.get("eval_video_save_freq", 25) or 25)  # eval 视频每 N 物理步采 1 帧
+        # 自动专家介入（替代 DROID 人类在环）：用到 takeover_step_frac·step_budget 预算仍未 success →
+        # 从当前状态调 play_once 录专家带逐 step 回放（action_type="human"）。EXPO/BC 通用，零侵入。
+        self._takeover_enable = bool(kwargs.get("takeover_enable", True))
+        self._takeover_step_frac = float(kwargs.get("takeover_step_frac", 0.5) or 0.5)
+        self._takeover_save_freq = int(kwargs.get("takeover_save_freq", 15) or 15)
+        self._takeover_active = False
+        self._takeover_attempted = False
+        self._replayer = None
 
         self._seed = int(seed)
         self._ep_count = 0
@@ -220,6 +234,9 @@ class RoboTwinEnv:
         self.env.set_instruction(instruction=self._instruction)
         self._steps_since_reset = 0
         self._success_once = False
+        self._takeover_active = False
+        self._takeover_attempted = False
+        self._replayer = None
         self._ep_count += 1
         return self.get_observation()
 
@@ -233,7 +250,12 @@ class RoboTwinEnv:
           - 图像 **CHW uint8**（RoboTwin get_rgb 返回 HWC，需转置）；AlohaInputs 要求 [C,H,W]。
           - state=joint_action.vector(14) = [左臂6,左夹爪1,右臂6,右夹爪1]。
         """
-        raw = self.env.get_obs()
+        if self._takeover_active and self._replayer is not None:
+            return self._replayer.current_obs()
+        return self._flatten_obs(self.env.get_obs())
+
+    def _flatten_obs(self, raw) -> Dict[str, Any]:
+        """RoboTwin get_obs → openpi 扁平 obs dict（在线 rollout 与专家录播共用）。"""
         cams = raw["observation"]
         state = np.asarray(raw["joint_action"]["vector"], dtype=np.float32)  # (14,)
 
@@ -251,13 +273,44 @@ class RoboTwinEnv:
             "prompt": self._instruction,
         }
 
+    def _should_takeover(self) -> bool:
+        return (not self._takeover_attempted) and should_takeover(
+            steps_since_reset=self._steps_since_reset,
+            step_budget=self._step_budget,
+            success_once=self._success_once,
+            step_frac=self._takeover_step_frac,
+            enabled=self._takeover_enable,
+        )
+
+    def _start_takeover(self) -> bool:
+        """从当前状态录专家带；成功→进入回放，失败→放弃接管（episode 走到超时自然失败）。"""
+        self._takeover_attempted = True
+        frames = record_expert_tape(
+            self.env, self._flatten_obs,
+            save_freq=self._takeover_save_freq, n_real_dims=self.n_real_dims,
+        )
+        if frames is None:
+            logging.warning("[RoboTwin] expert takeover recording failed; episode runs to timeout")
+            return False
+        self._replayer = TapeReplayer(frames)
+        self._takeover_active = True
+        logging.info("[RoboTwin] expert takeover started: %d frames at step %d",
+                     len(frames), self._steps_since_reset)
+        return True
+
     def step(self, action) -> Dict[str, Any]:
-        """执行**一个** action（方式2 逐 action TOPP）。返回 {executed_action}。"""
+        """逐 action 执行。接管期回放 expert 动作(action_type=human)；否则正常 take_action(policy)。"""
+        if not self._takeover_active and self._should_takeover():
+            self._start_takeover()
+        if self._takeover_active and self._replayer is not None:
+            qpos = np.asarray(self._replayer.next_action(), dtype=np.float64).reshape(-1)[: self.n_real_dims]
+            self._steps_since_reset += 1
+            return {"executed_action": qpos, "action_type": "human"}
         a = np.asarray(action, dtype=np.float64).reshape(-1)[: self.n_real_dims]
         self.env.take_action(a, action_type="qpos")
         self._steps_since_reset += 1
         # RoboTwin take_action 不返回改写后的动作；executed = 下发的 qpos 目标。
-        return {"executed_action": a}
+        return {"executed_action": a, "action_type": "policy"}
 
     # ---- SpeedTune 整段执行（新增，不改既有 per-action step）---------------
     # exec_backend 名 → RoboTwin 三后端（envs/_base_task.py）方法选择。
@@ -413,7 +466,15 @@ class RoboTwinEnv:
             pass
 
     def get_info_for_step(self, raw_obs=None) -> Tuple[bool, bool, float, float]:
-        """评测终止：(done, success, reward, mask)。稀疏 0/1 终局，无 shaping。"""
+        """评测终止：(done, success, reward, mask)。接管期严格走 tape（play_once 已把物理推到末态，
+        真实 check_success 会从回放第一帧就 True → tape 没放完就 done）；否则稀疏 0/1 终局。"""
+        if self._takeover_active and self._replayer is not None:
+            done, success, reward, mask = self._replayer.current_info()
+            self._success_once = self._success_once or success
+            if done:
+                logging.info("[RoboTwin] takeover episode done via tape: success=%s steps=%d",
+                             success, self._steps_since_reset)
+            return done, success, reward, mask
         success = bool(self.env.check_success())
         self._success_once = self._success_once or success
         # 用 RoboTwin 自己的 step_lim 作 episode 预算（reset 时读到），而非过小的固定 200——
