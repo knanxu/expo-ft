@@ -137,8 +137,34 @@ async def _handle_environment_request(websocket: _server.ServerConnection):
                             "n_exec_steps": int(result.get("n_exec_steps", 0)),
                             "duration": float(result.get("duration", 0.0)),
                             "exec_status": str(result.get("exec_status", "success")),
+                            "left_gripper": float(result.get("left_gripper", 0.0)),
+                            "right_gripper": float(result.get("right_gripper", 0.0)),
+                            "left_contact": bool(result.get("left_contact", False)),
+                            "right_contact": bool(result.get("right_contact", False)),
                             "action_type": "policy",
                         }
+                    await websocket.send(packer.pack(response))
+
+                elif operation == "start_video":
+                    # eval 用：开始录制本 episode 视频（仅 RoboTwinEnv 支持 start_eval_video）。
+                    env = _env_storage.get(request["env_id"])
+                    if env is None:
+                        response = {"status": "error", "message": f"Env {request['env_id']} not found"}
+                    else:
+                        if hasattr(env, "start_eval_video"):
+                            env.start_eval_video(int(request.get("episode_id", 0)))
+                        response = {"status": "success"}
+                    await websocket.send(packer.pack(response))
+
+                elif operation == "stop_video":
+                    # eval 用：收尾本 episode 视频（ffmpeg finalize）。
+                    env = _env_storage.get(request["env_id"])
+                    if env is None:
+                        response = {"status": "error", "message": f"Env {request['env_id']} not found"}
+                    else:
+                        if hasattr(env, "stop_eval_video"):
+                            env.stop_eval_video()
+                        response = {"status": "success"}
                     await websocket.send(packer.pack(response))
 
                 elif operation == "get_observation":

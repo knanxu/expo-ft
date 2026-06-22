@@ -23,6 +23,7 @@ import importlib
 import inspect
 import logging
 import os
+import subprocess
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -59,6 +60,7 @@ class RoboTwinEnv:
         self._stream_hold_steps = int(kwargs.get("stream_hold_steps", 15) or 15)
         _ks = kwargs.get("k_skip", None)
         self._k_skip = int(_ks) if _ks not in (None, "", 0) else None
+        self._eval_vsf = int(kwargs.get("eval_video_save_freq", 25) or 25)  # eval 视频每 N 物理步采 1 帧
 
         self._seed = int(seed)
         self._ep_count = 0
@@ -304,7 +306,7 @@ class RoboTwinEnv:
         v = float(speed_params.get("v", 1.0))
         vel_scale = float(speed_params.get("vel_scale", 1.0))
         acc_scale = float(speed_params.get("acc_scale", 1.0))
-        vsf = -1  # train 不实时录视频（eval 另设）
+        vsf = self._eval_vsf if getattr(self.env, "eval_video_path", None) else -1  # eval 视频开着时 >0
 
         if rt == "streaming":
             info = self._call_backend(self.env.take_chunk_action_streaming, chunk,
@@ -321,12 +323,94 @@ class RoboTwinEnv:
         info = info or {}
         # episode 预算按消耗的 action 数累加（与 RoboTwin step_lim 同语义；后端内部也自查 step_lim）。
         self._steps_since_reset += int(info.get("take_action_cnt_delta", 0) or 0)
+        lg, rg, lc, rc = self._contact_info()
         return {
             "executed_action": chunk[-1],
             "n_exec_steps": int(info.get("dense_steps", 0) or 0),
             "duration": float(info.get("duration", 0.0) or 0.0),
             "exec_status": str(info.get("status", "success")),
+            "left_gripper": lg, "right_gripper": rg,      # ∈[0,1] 0=闭合/抓取
+            "left_contact": lc, "right_contact": rc,      # sapien 物理接触（夹爪↔物体）
         }
+
+    # ---- eval 用：接触信号 + 视频录制（train 路径不触发）-------------------
+    # 物体判定：entity 名不含这些机器人/场景关键词即视为可抓物体。
+    _ROBOT_KW = ("link", "arm", "gripper", "finger", "wrist", "base", "joint",
+                 "ground", "wall", "table", "mount", "camera", "head", "body", "torso", "panda")
+
+    def _is_object(self, name: str) -> bool:
+        low = str(name).lower()
+        return not any(kw in low for kw in self._ROBOT_KW)
+
+    def _contact_info(self):
+        """(left_gripper_val, right_gripper_val, left_contact, right_contact)。
+
+        gripper val ∈[0,1]（0=闭合/抓取，1=张开）来自 robot；contact 用 sapien
+        ``scene.get_contacts()`` 检测含 gripper/finger 的 link 与"物体"的物理接触。
+        失败兜底 (0,0,False,False)，绝不影响主流程。
+        """
+        robot = getattr(self.env, "robot", None)
+        try:
+            lg = float(robot.get_left_gripper_val())
+            rg = float(robot.get_right_gripper_val())
+        except Exception:
+            lg = rg = 0.0
+        lc = rc = False
+        try:
+            for c in self.env.scene.get_contacts():
+                if not getattr(c, "points", None):
+                    continue
+                n0, n1 = c.bodies[0].entity.name, c.bodies[1].entity.name
+                for ga, gb in ((n0, n1), (n1, n0)):
+                    la = ga.lower()
+                    if ("gripper" in la or "finger" in la) and self._is_object(gb):
+                        if "left" in la or la.startswith("fl") or "_l" in la:
+                            lc = True
+                        elif "right" in la or la.startswith("fr") or "_r" in la:
+                            rc = True
+                        else:
+                            lc = rc = True
+        except Exception:
+            pass
+        return lg, rg, lc, rc
+
+    def start_eval_video(self, episode_id: int = 0):
+        """开 eval 视频（is_eval + video_dir 时）：ffmpeg 录 head_camera，对齐 RoboTwin eval_policy。"""
+        if not self.is_eval or not self.video_dir:
+            return
+        self.stop_eval_video()  # 收尾上一个（若有）
+        try:
+            os.makedirs(self.video_dir, exist_ok=True)
+            h = int(self._setup_kwargs.get("head_camera_h", 480) or 480)
+            w = int(self._setup_kwargs.get("head_camera_w", 640) or 640)
+            vsf, phys_hz = int(self._eval_vsf), 250
+            out = os.path.join(self.video_dir, f"episode{int(episode_id)}.mp4")
+            ff = subprocess.Popen(
+                ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo",
+                 "-pixel_format", "rgb24", "-video_size", f"{w}x{h}",
+                 "-framerate", f"{phys_hz}/{vsf}", "-i", "-", "-pix_fmt", "yuv420p",
+                 "-vcodec", "libx264", "-crf", "23", out], stdin=subprocess.PIPE)
+            self.env.eval_video_path = self.video_dir   # 让 _tick_eval_video 生效
+            self.env._set_eval_video_ffmpeg(ff, fps=phys_hz / vsf, phys_hz=phys_hz, video_save_freq=vsf)
+            logging.info("[RoboTwin] eval video → %s", out)
+        except Exception as e:
+            logging.warning("[RoboTwin] 起 eval video 失败（继续不录）：%s", e)
+            try:
+                self.env.eval_video_path = None
+            except Exception:
+                pass
+
+    def stop_eval_video(self):
+        """收尾 eval 视频（ffmpeg finalize）。"""
+        try:
+            if getattr(self.env, "eval_video_ffmpeg", None):
+                self.env._del_eval_video_ffmpeg()
+        except Exception:
+            pass
+        try:
+            self.env.eval_video_path = None
+        except Exception:
+            pass
 
     def get_info_for_step(self, raw_obs=None) -> Tuple[bool, bool, float, float]:
         """评测终止：(done, success, reward, mask)。稀疏 0/1 终局，无 shaping。"""

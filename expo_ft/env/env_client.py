@@ -155,8 +155,20 @@ class EnvClient:
             "n_exec_steps": int(response.get("n_exec_steps", 0)),
             "duration": float(response.get("duration", 0.0)),
             "exec_status": response.get("exec_status", "success"),
+            "left_gripper": float(response.get("left_gripper", 0.0)),
+            "right_gripper": float(response.get("right_gripper", 0.0)),
+            "left_contact": bool(response.get("left_contact", False)),
+            "right_contact": bool(response.get("right_contact", False)),
         }
         return executed, info
+
+    def start_video(self, env_id: str, episode_id: int = 0) -> None:
+        """eval: start recording this episode's video (server-side ffmpeg)."""
+        self._call_operation("start_video", {"env_id": env_id, "episode_id": int(episode_id)})
+
+    def stop_video(self, env_id: str) -> None:
+        """eval: finalize this episode's video."""
+        self._call_operation("stop_video", {"env_id": env_id})
 
     def get_observation(self, env_id: str) -> dict:
         """Get the observation of the environment."""
@@ -226,6 +238,20 @@ class EnvClientWrapper:
             "step_chunk",
             lambda: self.client.step_chunk(self.env_id, chunk, speed_params, exec_backend),
         )
+
+    def start_video(self, episode_id: int = 0):
+        """eval: 开始录制本 episode 视频（失败仅警告，不中断 eval）。"""
+        try:
+            self.client.start_video(self.env_id, episode_id)
+        except Exception as e:
+            logging.warning(f"start_video failed (ignored): {e}")
+
+    def stop_video(self):
+        """eval: 收尾本 episode 视频（失败仅警告）。"""
+        try:
+            self.client.stop_video(self.env_id)
+        except Exception as e:
+            logging.warning(f"stop_video failed (ignored): {e}")
 
     def get_observation(self):
         """Get the observation of the environment."""
