@@ -150,8 +150,35 @@ def _restore_dqn(learner, ckpt_dir):
     return learner.replace(q_net=learner.q_net.replace(params=q_params))
 
 
-def _save_and_plot(out_dir, ep, recs):
-    """存 episode 速度/接触时间序列 json + 画「激进度 vs 时间(接触阴影)」png。"""
+def _overlay_contact_grasp(ax, recs, x_key="t_sim", grasp_thresh=0.5):
+    """在 ax 上叠加：① 接触方块时段(红色阴影, left/right_contact=夹爪↔物体接触)；
+    ② 抓取事件(夹爪 开→闭 穿越阈值的紫色竖线, gripper∈[0,1] 0=闭/抓)。
+
+    recs 需含 left_contact/right_contact、left_gripper/right_gripper、x_key。
+    返回是否画了任何标注（供调用方决定图例）。
+    """
+    if not recs:
+        return
+    xs = [r[x_key] for r in recs]
+    _cl = True
+    for i, r in enumerate(recs):
+        if r.get("left_contact") or r.get("right_contact"):
+            x0 = xs[i - 1] if i > 0 else xs[0]
+            ax.axvspan(x0, xs[i], color="red", alpha=0.10,
+                       label="contact block" if _cl else None)
+            _cl = False
+    _gl = True
+    for i in range(1, len(recs)):
+        for key in ("left_gripper", "right_gripper"):
+            if recs[i - 1].get(key, 1.0) >= grasp_thresh > recs[i].get(key, 1.0):  # 开→闭 = 抓取
+                ax.axvline(xs[i], color="purple", ls=":", alpha=0.75,
+                           label="grasp (gripper close)" if _gl else None)
+                _gl = False
+                break  # 同一步左右都闭只画一条竖线
+
+
+def _save_and_plot(out_dir, ep, recs, ep_success=None):
+    """存 episode 速度/接触时间序列 json + 画 png（标题标 success + 接触方块阴影 + 抓取竖线）。"""
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, f"episode{ep}_speed.json"), "w") as f:
         json.dump(recs, f, indent=2)
@@ -169,22 +196,17 @@ def _save_and_plot(out_dir, ep, recs):
     aggr = [r["aggr_mean"] for r in recs]
     lg = [r["left_gripper"] for r in recs]
     rg = [r["right_gripper"] for r in recs]
-    contact = [bool(r["left_contact"] or r["right_contact"]) for r in recs]
 
     fig, ax = plt.subplots(figsize=(11, 5))
-    # 接触时段阴影（每个决策步是 [t_{i-1}, t_i] 一段）
-    for i, c in enumerate(contact):
-        if c:
-            t0 = t[i - 1] if i > 0 else 0.0
-            ax.axvspan(t0, t[i], color="red", alpha=0.12,
-                       label="contact" if i == contact.index(True) else None)
+    _overlay_contact_grasp(ax, recs, x_key="t_sim")   # 接触方块阴影 + 抓取竖线
     ax.plot(t, aggr, "-o", color="tab:blue", label="aggressiveness (0慢~1快)")
     ax.plot(t, lg, "--", color="tab:green", alpha=0.6, label="left gripper (0闭~1开)")
     ax.plot(t, rg, "--", color="tab:olive", alpha=0.6, label="right gripper")
     ax.set_xlabel("sim time (s)")
     ax.set_ylabel("aggressiveness / gripper")
     ax.set_ylim(-0.05, 1.05)
-    ax.set_title(f"episode {ep}: speed knob vs contact")
+    _tag = "" if ep_success is None else (" [SUCCESS]" if ep_success else " [FAILED]")
+    ax.set_title(f"episode {ep}{_tag}: speed knob vs grasp/contact")
     ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, f"episode{ep}_speed.png"), dpi=120)
@@ -259,8 +281,15 @@ def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
 
         if record_video:
             env.stop_video()
+            _tag = "SUCCESS" if ep_success else "FAIL"
+            try:  # 视频名加 success/fail 后缀（同机共享 video_dir；失败仅警告不中断）
+                _vp = os.path.join(out_dir, "videos", f"episode{ep}.mp4")
+                if os.path.exists(_vp):
+                    os.replace(_vp, os.path.join(out_dir, "videos", f"episode{ep}_{_tag}.mp4"))
+            except Exception as _e:
+                logging.warning("[%s] episode%d video rename 失败(忽略): %s", exec_backend, ep, _e)
         n_succ += int(ep_success)
-        _save_and_plot(out_dir, ep, recs)
+        _save_and_plot(out_dir, ep, recs, ep_success)
         ep_dense = int(sum(int(r["dense_steps"]) for r in recs))
         episodes.append(dict(
             ep=ep, success=bool(ep_success), n_decision_steps=len(recs),

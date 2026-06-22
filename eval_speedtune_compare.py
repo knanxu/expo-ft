@@ -158,16 +158,18 @@ def _plot_compare(out_dir, ra, rb):
     axes[0].bar(x - w / 2, da, w, label=na, color="tab:orange")
     axes[0].bar(x + w / 2, db, w, label=nb, color="tab:blue")
     for i, e in enumerate(epa):
-        if not e["success"]:
-            axes[0].text(x[i] - w / 2, da[i], "✗", ha="center", va="bottom", color="red", fontsize=9)
+        mk, col = ("✓", "green") if e["success"] else ("✗", "red")
+        axes[0].text(x[i] - w / 2, da[i], mk, ha="center", va="bottom", color=col,
+                     fontsize=12, fontweight="bold")
     for i, e in enumerate(epb):
-        if not e["success"]:
-            axes[0].text(x[i] + w / 2, db[i], "✗", ha="center", va="bottom", color="red", fontsize=9)
+        mk, col = ("✓", "green") if e["success"] else ("✗", "red")
+        axes[0].text(x[i] + w / 2, db[i], mk, ha="center", va="bottom", color=col,
+                     fontsize=12, fontweight="bold")
     axes[0].axhline(ra["mean_dense_steps"], ls="--", color="tab:orange", alpha=0.5)
     axes[0].axhline(rb["mean_dense_steps"], ls="--", color="tab:blue", alpha=0.5)
     axes[0].set_xlabel("episode")
     axes[0].set_ylabel("execution dense_steps (÷250 = sim sec)")
-    axes[0].set_title("per-episode 执行步数（越低越快; ✗=失败 episode）")
+    axes[0].set_title("per-episode 执行步数（越低越快; ✓=成功 ✗=失败）")
     axes[0].set_xticks(x)
     axes[0].legend(fontsize=9)
 
@@ -197,13 +199,15 @@ def _plot_compare(out_dir, ra, rb):
         if not rep:
             ax.set_title(f"{name}: 无 episode")
             continue
+        ev._overlay_contact_grasp(ax, rep["recs"], x_key="step")  # 接触方块阴影 + 抓取竖线
         steps = [r["step"] for r in rep["recs"]]
         for k in _param_keys(rep):
             ax.plot(steps, [r.get(k, np.nan) for r in rep["recs"]], "-o", ms=3, label=k)
         ax.set_xlabel("decision step")
         ax.set_ylabel("speed param value")
-        ax.set_title(f"{name} ep{rep['ep']}: 实际加速参数")
-        ax.legend(fontsize=9)
+        _tag = " [SUCCESS]" if rep["success"] else " [FAILED]"
+        ax.set_title(f"{name} ep{rep['ep']}{_tag}: 加速参数 + 抓取/接触")
+        ax.legend(fontsize=8)
     fig2.suptitle("各 backend 实际下发的加速控制参数随决策步")
     fig2.tight_layout()
     fig2.savefig(os.path.join(out_dir, "compare_knob.png"), dpi=120)
