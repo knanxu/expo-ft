@@ -167,9 +167,14 @@ learner 端**完全复用** `action_type=="human"` → `is_hil` 通路；DROID �
 
 ## 11. 实现待验证点（plan 阶段细化）
 
-1. **录播带取 obs 的接入点**：复用 RoboTwin `play_once` 内 `_take_picture`（`_base_task.py:517`）的
-   `save_freq` 记帧机制，还是在 `client_robotwin` 侧 wrap 执行 loop 自录 `(obs, qpos)`——以拿到与
-   offline demo 同粒度（`save_freq`）的 `(obs, qpos)` 序列为准。
+1. **录播带取 obs 的接入点（已核实）**：`get_obs()`（`_base_task.py:446`）任何时刻返回完整 obs
+   （三相机 rgb + `joint_action.vector` 14-D qpos），格式正是 `RoboTwinEnv.get_observation`/
+   `process_robotwin_dataset` 所用。`play_once` 执行中已在 `save_freq` 边界调 `_take_picture`
+   （`together_move_to_pose:959` / `take_dense_action:1553`），但 `_take_picture`（`:517`）**存盘且
+   受 `save_data` gate**，不直接用。**结论**：录播时在 `client_robotwin` 侧运行时把
+   `self.env._take_picture` **monkey-patch 成"内存收集 `get_obs()`"**（跑完恢复），
+   `play_once(save_freq=目标采样率)` → 得内存 tape；不改 RoboTwin 本体、与 offline demo 同粒度。
+   `action[t] = vector[t+1]`（下一帧绝对 qpos）与 `process_robotwin_dataset` 对齐。
 2. **触发时序对齐 + 回放期一律走 tape**：触发那一步 learner 已 `get_observation` 拿到真实当前 obs
    （≈ tape[0].obs），`step` 内触发+录 tape 后返回 tape[0].qpos；之后 `get_observation` 走 tape 回放。
    需保证 `(obs_t, action_t, reward_t, next_obs)` 衔接正确。
