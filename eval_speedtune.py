@@ -9,6 +9,9 @@
 DQN 用 greedy(无探索)。架构同 train：client-learner 分离(VLA/DQN 在 JAX venv，RoboTwin 在 sim venv)，
 经 client_robotwin 的 step_chunk(回传接触) + start/stop_video(录像) 协议。
 
+本模块的 ``_build_vla`` / ``_build_dqn`` / ``run_backend_episodes`` 抽成可复用单元，供
+``eval_speedtune_compare.py``（双 backend 加速对比）共用——VLA(3B) 只加载一次，两个 backend 复用。
+
 用法（云端，learner venv）：
     SPEEDTUNE_VLA_CKPT=<drift ckpt> SPEEDTUNE_VLA_ASSETS=<...> SPEEDTUNE_VLA_ASSET_ID=<...> \
     uv run python eval_speedtune.py \
@@ -61,8 +64,12 @@ config_flags.DEFINE_config_file(
     "config_task", "configs/task/robotwin_stack_blocks.py", "Task config.", lock_config=False)
 
 
-def _build_eval(config, config_task, seed, mesh, shardings, env):
-    """加载冻结 VLA + drift 前向/反归一化 + exec_backend + DQN（结构同 train 的 _setup_speedtune）。"""
+def _build_vla(config, config_task, seed, mesh, shardings, env, resume):
+    """加载冻结 VLA + drift 前向/反归一化（**与 exec_backend / DQN 无关**，可被多 backend 复用）。
+
+    返回 dict: drift_forward / unnormalize / preprocess / H / A / feat_dim / vfeat0。
+    feat_dim、vfeat0 仅由 VLA 决定（与 backend 无关），供 _build_dqn 构造 DQN。
+    """
     from expo_ft.agents.vla.pi05 import build_pi05
     from expo_ft.agents.vla.drift_adapters import make_drift_apply_fn
 
@@ -72,7 +79,7 @@ def _build_eval(config, config_task, seed, mesh, shardings, env):
 
     actor, actor_train_state, _t, _ak, _md = build_pi05(
         config, seed, mesh, data_sharding, replicated_sharding,
-        FLAGS.resume, config_task.language_instruction,
+        resume, config_task.language_instruction,
     )
     H = int(actor.model_config.action_horizon)
     A = int(actor.model_config.action_dim)
@@ -103,10 +110,17 @@ def _build_eval(config, config_task, seed, mesh, shardings, env):
     example_z = jax.random.normal(jax.random.PRNGKey(seed + 7), (1, H, A))
     _m0, _c0, vfeat0 = drift_forward(example_obs, example_z)
     feat_dim = int(np.asarray(vfeat0).shape[-1])
+    logging.info("SpeedTune eval VLA: feat_dim=%d H=%d A=%d", feat_dim, H, A)
 
-    backend = build_backend(str(config.exec_backend))
-    logging.info("SpeedTune eval: feat_dim=%d H=%d A=%d backend=%s head_sizes=%s",
-                 feat_dim, H, A, backend.name, backend.head_sizes)
+    return dict(drift_forward=drift_forward, unnormalize=unnormalize, preprocess=preprocess,
+                H=H, A=A, feat_dim=feat_dim, vfeat0=vfeat0)
+
+
+def _build_dqn(config, seed, exec_backend, dqn_ckpt, feat_dim, vfeat0):
+    """构造 exec_backend + 从 ckpt 恢复 DQN（greedy，epsilon=0）。返回 dict: backend / learner。"""
+    backend = build_backend(str(exec_backend))
+    logging.info("SpeedTune eval DQN: backend=%s head_sizes=%s ckpt=%s",
+                 backend.name, backend.head_sizes, dqn_ckpt)
 
     dqn = SpeedTuneLearner.create(
         rng=jax.random.PRNGKey(seed), feat_dim=feat_dim, head_sizes=backend.head_sizes,
@@ -115,9 +129,8 @@ def _build_eval(config, config_task, seed, mesh, shardings, env):
         detach_input=bool(config.detach_q_input), epsilon=0.0,   # greedy
         example_feat=jnp.asarray(vfeat0),
     )
-    dqn = _restore_dqn(dqn, FLAGS.dqn_ckpt)
-    return dict(drift_forward=drift_forward, unnormalize=unnormalize, preprocess=preprocess,
-                backend=backend, learner=dqn, H=H, A=A)
+    dqn = _restore_dqn(dqn, dqn_ckpt)
+    return dict(backend=backend, learner=dqn)
 
 
 def _restore_dqn(learner, ckpt_dir):
@@ -178,53 +191,39 @@ def _save_and_plot(out_dir, ep, recs):
     plt.close(fig)
 
 
-def main(_):
-    init_logging()
-    config, config_task = FLAGS.config, FLAGS.config_task
-    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
-    jax.config.update("jax_default_matmul_precision", "highest")
+def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
+                         n_episodes, max_decision_steps, seed, out_dir, record_video):
+    """跑 n_episodes（录视频 + 逐 chunk 记录 + 每 episode _save_and_plot），返回聚合 result dict。
 
-    mesh = openpi_sharding.make_mesh(FLAGS.fsdp_devices)
-    data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(openpi_sharding.DATA_AXIS))
-    replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    Args:
+      env:     已 reset 的 EnvClientWrapper（连对应 backend 的 env server）。
+      vla:     _build_vla 返回的 dict（drift_forward/unnormalize/preprocess/H/A）。
+      backend: _build_dqn 返回的 ExecBackend（decode 用）。
+      learner: _build_dqn 返回的 greedy DQN。
+      exec_backend: backend 名字（传 env.step_chunk + 记录/标题）。
 
-    out_dir = FLAGS.output_dir
-    os.makedirs(out_dir, exist_ok=True)
-    exec_backend = str(config.exec_backend)
-    example_action = np.asarray(
-        config_task.get("example_action", np.zeros((1, int(config.n_real_dims)), dtype=np.float32)),
-        dtype=np.float32)
+    Returns:
+      result dict：exec_backend / n_episodes / success / success_rate /
+        mean_dense_steps / mean_sim_time_s / mean_dense_steps_success /
+        aggr_in_contact_mean / aggr_free_mean / decel_near_contact /
+        n_contact_steps / n_free_steps / episodes(每 episode 的 success/步数/recs)。
+      其中 **dense_steps（物理步数, ÷250=仿真秒）是跨 backend 唯一硬可比的执行时间基准**。
+    """
+    drift_forward, unnormalize, preprocess = vla["drift_forward"], vla["unnormalize"], vla["preprocess"]
+    H, A = vla["H"], vla["A"]
 
-    logging.info("Creating RoboTwin eval env (is_eval, 录视频) via env_client ...")
-    env = EnvClientWrapper(
-        env_creation_request={
-            "example_action": example_action, "env_usage": "eval",
-            "video_dir": os.path.join(out_dir, "videos"),
-            "exec_backend": exec_backend,
-            "k_skip": config.get("k_skip", None),
-            "stream_hold_steps": int(config.get("stream_hold_steps", 15)),
-            "eval_video_save_freq": 25,
-        },
-        host=FLAGS.client_host, port=FLAGS.client_port,
-    )
-    env.reset()
-
-    setup = _build_eval(config, config_task, FLAGS.seed, mesh,
-                        (data_sharding, replicated_sharding), env)
-    drift_forward, unnormalize, preprocess = setup["drift_forward"], setup["unnormalize"], setup["preprocess"]
-    backend, learner, H, A = setup["backend"], setup["learner"], setup["H"], setup["A"]
-
-    rng = np.random.default_rng(FLAGS.seed)
+    rng = np.random.default_rng(seed)
     n_succ = 0
     all_contact_aggr, all_free_aggr = [], []   # 跨 episode 汇总：接触 vs 非接触时段激进度
+    episodes = []
 
-    for ep in range(FLAGS.n_episodes):
+    for ep in range(n_episodes):
         obs = env.reset()
-        if FLAGS.record_video:
+        if record_video:
             env.start_video(ep)
         recs, t_acc, ep_success = [], 0.0, False
 
-        for step_i in tqdm.tqdm(range(FLAGS.max_decision_steps), desc=f"ep{ep}", disable=False):
+        for step_i in tqdm.tqdm(range(max_decision_steps), desc=f"{exec_backend} ep{ep}", disable=False):
             obs_m = preprocess(obs)
             z = jax.random.normal(jax.random.PRNGKey(int(rng.integers(0, 2**31 - 1))), (1, H, A))
             mean, _cond, value_feat = drift_forward(obs_m, z)
@@ -258,32 +257,103 @@ def main(_):
                 break
             obs = env.get_observation()
 
-        if FLAGS.record_video:
+        if record_video:
             env.stop_video()
         n_succ += int(ep_success)
         _save_and_plot(out_dir, ep, recs)
-        logging.info("episode %d: success=%s steps=%d sim_time=%.2fs (video+json+png 已存)",
-                     ep, ep_success, len(recs), t_acc)
+        ep_dense = int(sum(int(r["dense_steps"]) for r in recs))
+        episodes.append(dict(
+            ep=ep, success=bool(ep_success), n_decision_steps=len(recs),
+            total_dense_steps=ep_dense, sim_time_s=round(t_acc, 4), recs=recs,
+        ))
+        logging.info("[%s] episode %d: success=%s decision_steps=%d dense_steps=%d sim_time=%.2fs",
+                     exec_backend, ep, ep_success, len(recs), ep_dense, t_acc)
 
-    # ---- 汇总：接触 vs 非接触时段的平均激进度（回答「接触附近是否减速」）----
+    # ---- 汇总：接触 vs 非接触时段的平均激进度 + 加速指标（dense_steps / sim_time）----
     c_mean = float(np.mean(all_contact_aggr)) if all_contact_aggr else float("nan")
     f_mean = float(np.mean(all_free_aggr)) if all_free_aggr else float("nan")
+    succ_eps = [e for e in episodes if e["success"]]
+    result = dict(
+        exec_backend=exec_backend, n_episodes=n_episodes, success=n_succ,
+        success_rate=n_succ / max(n_episodes, 1),
+        mean_dense_steps=float(np.mean([e["total_dense_steps"] for e in episodes])) if episodes else 0.0,
+        mean_sim_time_s=float(np.mean([e["sim_time_s"] for e in episodes])) if episodes else 0.0,
+        # 只在成功 episode 上算执行步数（加速对比应在「都成功」的前提下比，避免失败早停拉低步数）
+        mean_dense_steps_success=(float(np.mean([e["total_dense_steps"] for e in succ_eps]))
+                                  if succ_eps else float("nan")),
+        aggr_in_contact_mean=c_mean, aggr_free_mean=f_mean,
+        decel_near_contact=bool(c_mean < f_mean) if (all_contact_aggr and all_free_aggr) else None,
+        n_contact_steps=len(all_contact_aggr), n_free_steps=len(all_free_aggr),
+        episodes=episodes,
+    )
+    return result
+
+
+def main(_):
+    init_logging()
+    config, config_task = FLAGS.config, FLAGS.config_task
+    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
+    jax.config.update("jax_default_matmul_precision", "highest")
+
+    mesh = openpi_sharding.make_mesh(FLAGS.fsdp_devices)
+    data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(openpi_sharding.DATA_AXIS))
+    replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+
+    out_dir = FLAGS.output_dir
+    os.makedirs(out_dir, exist_ok=True)
+    exec_backend = str(config.exec_backend)
+    example_action = np.asarray(
+        config_task.get("example_action", np.zeros((1, int(config.n_real_dims)), dtype=np.float32)),
+        dtype=np.float32)
+
+    logging.info("Creating RoboTwin eval env (is_eval, 录视频) via env_client ...")
+    env = EnvClientWrapper(
+        env_creation_request={
+            "example_action": example_action, "env_usage": "eval",
+            "video_dir": os.path.join(out_dir, "videos"),
+            "exec_backend": exec_backend,
+            "k_skip": config.get("k_skip", None),
+            "stream_hold_steps": int(config.get("stream_hold_steps", 15)),
+            "eval_video_save_freq": 25,
+        },
+        host=FLAGS.client_host, port=FLAGS.client_port,
+    )
+    env.reset()
+
+    vla = _build_vla(config, config_task, FLAGS.seed, mesh,
+                     (data_sharding, replicated_sharding), env, FLAGS.resume)
+    dqnpack = _build_dqn(config, FLAGS.seed, exec_backend, FLAGS.dqn_ckpt,
+                         vla["feat_dim"], vla["vfeat0"])
+
+    result = run_backend_episodes(
+        env, vla, dqnpack["backend"], dqnpack["learner"], exec_backend,
+        n_episodes=FLAGS.n_episodes, max_decision_steps=FLAGS.max_decision_steps,
+        seed=FLAGS.seed, out_dir=out_dir, record_video=FLAGS.record_video,
+    )
+
+    # ---- 汇总写盘（保持原 eval_summary.json 字段，新增加速指标 mean_dense_steps）----
     summary = {
-        "n_episodes": FLAGS.n_episodes, "success": n_succ,
-        "success_rate": n_succ / max(FLAGS.n_episodes, 1),
-        "aggr_in_contact_mean": c_mean,       # 接触时段平均激进度（越低=接触附近越减速）
-        "aggr_free_mean": f_mean,             # 非接触时段平均激进度
-        "decel_near_contact": bool(c_mean < f_mean) if (all_contact_aggr and all_free_aggr) else None,
-        "n_contact_steps": len(all_contact_aggr), "n_free_steps": len(all_free_aggr),
+        "n_episodes": result["n_episodes"], "success": result["success"],
+        "success_rate": result["success_rate"],
+        "mean_dense_steps": result["mean_dense_steps"],
+        "mean_dense_steps_success": result["mean_dense_steps_success"],
+        "mean_sim_time_s": result["mean_sim_time_s"],
+        "aggr_in_contact_mean": result["aggr_in_contact_mean"],
+        "aggr_free_mean": result["aggr_free_mean"],
+        "decel_near_contact": result["decel_near_contact"],
+        "n_contact_steps": result["n_contact_steps"], "n_free_steps": result["n_free_steps"],
     }
     with open(os.path.join(out_dir, "eval_summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
-    logging.info("==== SpeedTune eval 汇总 ====")
-    logging.info("success: %d/%d (%.0f%%)", n_succ, FLAGS.n_episodes, 100 * summary["success_rate"])
+    logging.info("==== SpeedTune eval 汇总 (%s) ====", exec_backend)
+    logging.info("success: %d/%d (%.0f%%)", result["success"], result["n_episodes"],
+                 100 * result["success_rate"])
+    logging.info("平均执行步数 dense_steps=%.0f (成功 episode=%.0f) | 平均仿真时间=%.2fs",
+                 result["mean_dense_steps"], result["mean_dense_steps_success"], result["mean_sim_time_s"])
     logging.info("接触时段平均激进度 = %.3f | 非接触时段 = %.3f → 接触附近%s",
-                 c_mean, f_mean,
-                 "减速 ✓" if summary["decel_near_contact"] else
-                 ("未减速" if summary["decel_near_contact"] is False else "(数据不足)"))
+                 result["aggr_in_contact_mean"], result["aggr_free_mean"],
+                 "减速 ✓" if result["decel_near_contact"] else
+                 ("未减速" if result["decel_near_contact"] is False else "(数据不足)"))
     logging.info("输出目录: %s（videos/ + episode*_speed.{json,png} + eval_summary.json）", out_dir)
 
 
