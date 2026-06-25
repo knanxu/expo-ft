@@ -15,6 +15,16 @@
 > 调试时不要假设本地能复现实验或读到训练产物——需要运行结果 / 实际超参 / success 曲线时，**问维护人**（或让其在云端取），
 > 不要从本地空目录推断"未配置"。本地 `/home/xukainan/RoboTwin` 仅供**读代码对照**（fork 自 knanxu/RoboTwin）。
 
+> **云端绝对路径（写脚本 / 给云端命令时直接用这些；本地无对应物，勿据本地推断）**：
+> - 项目代码：`EXPO_ROOT=/home/chenlu/expo-ft`、`ROBOTWIN_ROOT=/home/chenlu/RoboTwin`。
+> - 冻结 drift pi0.5 ckpt（`stack_blocks_two`，EXPO/SpeedTune 共用）根目录：
+>   `/home/chenlu/openpi/checkpoints/pi05_aloha_robotwin_drifting_stack_blocks_two/drifting_v1/29999/`；
+>   其下 `params/`（权重）与 `assets/`（norm_stats）**平级**，norm_stats 在 `assets/trossen/`（asset_id=`trossen`）。
+> - SpeedTune 三个环境变量（`expo_ft/utils/train_utils.py` 拼成 openpi `weight_loader` + `AssetsConfig`）：
+>   `SPEEDTUNE_VLA_CKPT=<根目录>/params`、`SPEEDTUNE_VLA_ASSETS=<根目录>/assets`、`SPEEDTUNE_VLA_ASSET_ID=trossen`。
+>   坑：① `assets/` 与 `params/` **平级**而 CKPT 指向 `params/`，所以 `$SPEEDTUNE_VLA_CKPT/assets`（=`params/assets`）是错的，必须用 `<根目录>/assets`；
+>   ② asset_id 实际是 `trossen`（`speedtune_dqn_config.py` 注释里的 "robotwin" 只是占位例子，用错→norm_stats 留空坑，见 memory）。
+
 > **当前主线**：让 EXPO-FT 原算法（`EXPOLearner`/`BCLearner`）在 drift pi0.5 + RoboTwin 上跑通。
 > drift 对 EXPO-FT 是**纯 config 切换**——合并后的 `pi0.py` 里 `sample_actions`/`compute_loss` 已按
 > `use_drifting_loss` 自动分发到 drift，EXPO 的采样（`_jitted_infer`）与 actor 更新（`train_step`）天然吃到，
