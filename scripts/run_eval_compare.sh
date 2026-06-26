@@ -72,6 +72,17 @@ trap cleanup EXIT INT TERM
 
 cd "$EXPO_ROOT"
 
+# ---- 0) 端口预检：被占用 = 有残留旧 server，必须先清理（否则会 silent 连到旧 server 跑旧代码、无视频）----
+for _port in "$PORT_A" "$PORT_B"; do
+  if (exec 3<>"/dev/tcp/127.0.0.1/${_port}") 2>/dev/null; then
+    exec 3>&- 3<&- 2>/dev/null || true
+    echo "[ERROR] 端口 ${_port} 已被占用——极可能是上次 RoboTwin server 残留进程。" >&2
+    echo "        若继续会 silent 连到旧 server（跑旧代码、无 start_video、无 contact）。请先清理后重跑：" >&2
+    echo "        pkill -9 -f run_robotwin_client; pkill -9 -f eval_speedtune; sleep 3; nvidia-smi" >&2
+    exit 1
+  fi
+done
+
 # ---- 1) 起两个 env server（每个独占一卡，光追渲染）----
 BACKENDS=("$BACKEND_A" "$BACKEND_B")
 PORTS=("$PORT_A" "$PORT_B")
@@ -89,6 +100,13 @@ done
 echo "[*] 等 server 渲染自检/就绪 (${SERVER_WAIT}s)；正常会在 server 日志打印 'Render Well' ..."
 sleep "$SERVER_WAIT"
 for be in "$BACKEND_A" "$BACKEND_B"; do
+  # bind 失败检测最优先：'Render Well' 会在 bind 之前打印, 不能只靠它判就绪（这正是上次 silent 连到旧 server 的坑）。
+  if grep -q "address already in use" "$OUTPUT_DIR/server_${be}.log" 2>/dev/null; then
+    echo "[ERROR] $be server 端口 bind 失败（address already in use，见 server_${be}.log）。" >&2
+    echo "        新 server 没起来，继续会 silent 连到残留旧 server。中止。先清理后重跑：" >&2
+    echo "        pkill -9 -f run_robotwin_client; pkill -9 -f eval_speedtune; sleep 3; nvidia-smi" >&2
+    exit 1
+  fi
   if grep -q "Render Well" "$OUTPUT_DIR/server_${be}.log" 2>/dev/null; then
     echo "[$be] server ✓ Render Well"
   elif grep -q "Render Error" "$OUTPUT_DIR/server_${be}.log" 2>/dev/null; then
