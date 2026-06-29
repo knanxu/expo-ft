@@ -2,7 +2,7 @@
 """SpeedTune eval：冻结 VLA(base policy) + 训练好的 DQN(速度模块)，在 RoboTwin 跑 N episode。
 
 每个 episode：① 录制 head_camera 视频(server 端 ffmpeg)；② 每个决策步记录速度控制参数
-(v/vel_scale/acc_scale + 归一化激进度) 与接触信号(夹爪值 + sapien 物理接触) + 累计仿真时间；
+(v/vel_limit/acc_limit + 归一化激进度) 与接触信号(夹爪值 + sapien 物理接触) + 累计仿真时间；
 ③ 存 json + 画「激进度 vs 时间(接触时段阴影)」图。结尾汇总**接触时段 vs 非接触时段的平均激进度**
 ——直接回答「是否在接触附近减速、其他时候加速」。
 
@@ -40,7 +40,7 @@ from expo_ft.env.env_client import EnvClientWrapper
 from expo_ft.utils.train_utils import init_logging
 
 from expo_ft.agents.alg.speedtune_dqn import SpeedTuneLearner
-from expo_ft.speedtune.exec_backends import build_backend
+from expo_ft.speedtune.exec_backends import build_backend, parse_force_limit
 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -199,8 +199,8 @@ def _save_and_plot(out_dir, ep, recs, ep_success=None):
 
     fig, ax = plt.subplots(figsize=(11, 5))
     _overlay_contact_grasp(ax, recs, x_key="t_sim")   # 接触方块阴影 + 抓取竖线
-    ax.plot(t, aggr, "-o", color="tab:blue", label="aggressiveness (0慢~1快)")
-    ax.plot(t, lg, "--", color="tab:green", alpha=0.6, label="left gripper (0闭~1开)")
+    ax.plot(t, aggr, "-o", color="tab:blue", label="aggressiveness (0=slow ~ 1=fast)")
+    ax.plot(t, lg, "--", color="tab:green", alpha=0.6, label="left gripper (0=closed ~ 1=open)")
     ax.plot(t, rg, "--", color="tab:olive", alpha=0.6, label="right gripper")
     ax.set_xlabel("sim time (s)")
     ax.set_ylabel("aggressiveness / gripper")
@@ -271,7 +271,7 @@ def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
                 left_contact=lc, right_contact=rc,
                 exec_status=info.get("exec_status", "success"), success=bool(success),
             )
-            rec.update({k: float(v) for k, v in speed_params.items()})  # v / vel_scale / acc_scale
+            rec.update({k: float(v) for k, v in speed_params.items()})  # v / vel_limit / acc_limit
             recs.append(rec)
             (all_contact_aggr if (lc or rc) else all_free_aggr).append(aggr_mean)
 
@@ -344,6 +344,7 @@ def main(_):
             "k_skip": config.get("k_skip", None),
             "stream_hold_steps": int(config.get("stream_hold_steps", 15)),
             "eval_video_save_freq": 25,
+            "force_limit": parse_force_limit(config.get("force_limit", "")),
         },
         host=FLAGS.client_host, port=FLAGS.client_port,
     )

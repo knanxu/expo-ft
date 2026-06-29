@@ -34,6 +34,7 @@ import etils.epath as epath
 
 import openpi.training.sharding as openpi_sharding
 from expo_ft.env.env_client import EnvClientWrapper
+from expo_ft.speedtune.exec_backends import parse_force_limit
 from expo_ft.utils.train_utils import init_logging
 
 # 复用 eval_speedtune 的可复用单元（import 会触发其 flags 定义，共享
@@ -75,6 +76,7 @@ def _make_env(out_sub, exec_backend, port, config, config_task):
             "k_skip": config.get("k_skip", None),
             "stream_hold_steps": int(config.get("stream_hold_steps", 15)),
             "eval_video_save_freq": 25,
+            "force_limit": parse_force_limit(config.get("force_limit", "")),
         },
         host=FLAGS.client_host, port=port,
     )
@@ -89,7 +91,7 @@ def _representative_episode(episodes):
 
 
 def _param_keys(episode):
-    """从代表 episode 的首个 rec 反推该 backend 实际下发的加速参数 keys（v/vel_scale/acc_scale）。"""
+    """从代表 episode 的首个 rec 反推该 backend 实际下发的加速参数 keys（v/vel_limit/acc_limit）。"""
     if not episode or not episode["recs"]:
         return []
     return [k for k in episode["recs"][0].keys() if k not in _FIXED_REC_KEYS]
@@ -158,18 +160,18 @@ def _plot_compare(out_dir, ra, rb):
     axes[0].bar(x - w / 2, da, w, label=na, color="tab:orange")
     axes[0].bar(x + w / 2, db, w, label=nb, color="tab:blue")
     for i, e in enumerate(epa):
-        mk, col = ("✓", "green") if e["success"] else ("✗", "red")
+        mk, col = ("S", "green") if e["success"] else ("F", "red")
         axes[0].text(x[i] - w / 2, da[i], mk, ha="center", va="bottom", color=col,
                      fontsize=12, fontweight="bold")
     for i, e in enumerate(epb):
-        mk, col = ("✓", "green") if e["success"] else ("✗", "red")
+        mk, col = ("S", "green") if e["success"] else ("F", "red")
         axes[0].text(x[i] + w / 2, db[i], mk, ha="center", va="bottom", color=col,
                      fontsize=12, fontweight="bold")
     axes[0].axhline(ra["mean_dense_steps"], ls="--", color="tab:orange", alpha=0.5)
     axes[0].axhline(rb["mean_dense_steps"], ls="--", color="tab:blue", alpha=0.5)
     axes[0].set_xlabel("episode")
     axes[0].set_ylabel("execution dense_steps (÷250 = sim sec)")
-    axes[0].set_title("per-episode 执行步数（越低越快; ✓=成功 ✗=失败）")
+    axes[0].set_title("Per-episode exec steps (lower=faster; S=success F=fail)")
     axes[0].set_xticks(x)
     axes[0].legend(fontsize=9)
 
@@ -181,23 +183,23 @@ def _plot_compare(out_dir, ra, rb):
         axes[1].plot([r["step"] for r in reb["recs"]], [r["aggr_mean"] for r in reb["recs"]],
                      "-o", color="tab:blue", ms=3, label=f"{nb} ep{reb['ep']}")
     axes[1].set_xlabel("decision step")
-    axes[1].set_ylabel("aggressiveness (0慢~1快)")
+    axes[1].set_ylabel("aggressiveness (0=slow ~ 1=fast)")
     axes[1].set_ylim(-0.05, 1.05)
-    axes[1].set_title("加速激进度（归一化）随决策步")
+    axes[1].set_title("Normalized aggressiveness vs decision step")
     axes[1].legend(fontsize=9)
 
     sp = _ratio(ra["mean_dense_steps_success"], rb["mean_dense_steps_success"])
     sp_txt = f"  |  speedup({nb}/{na}, success)={sp:.2f}x" if sp is not None else ""
-    fig.suptitle(f"SpeedTune backend 对比: {na} vs {nb}{sp_txt}")
+    fig.suptitle(f"SpeedTune backend comparison: {na} vs {nb}{sp_txt}")
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "compare_speedup.png"), dpi=120)
     plt.close(fig)
 
-    # ---- 图2 compare_knob.png：各 backend 实际加速参数 (v/vel_scale/acc_scale) 随决策步 ----
+    # ---- 图2 compare_knob.png：各 backend 实际加速参数 (v/vel_limit/acc_limit) 随决策步 ----
     fig2, axes2 = plt.subplots(1, 2, figsize=(15, 5), sharey=False)
     for ax, rep, name in ((axes2[0], rea, na), (axes2[1], reb, nb)):
         if not rep:
-            ax.set_title(f"{name}: 无 episode")
+            ax.set_title(f"{name}: no episode")
             continue
         ev._overlay_contact_grasp(ax, rep["recs"], x_key="step")  # 接触方块阴影 + 抓取竖线
         steps = [r["step"] for r in rep["recs"]]
@@ -206,9 +208,9 @@ def _plot_compare(out_dir, ra, rb):
         ax.set_xlabel("decision step")
         ax.set_ylabel("speed param value")
         _tag = " [SUCCESS]" if rep["success"] else " [FAILED]"
-        ax.set_title(f"{name} ep{rep['ep']}{_tag}: 加速参数 + 抓取/接触")
+        ax.set_title(f"{name} ep{rep['ep']}{_tag}: speed params + grasp/contact")
         ax.legend(fontsize=8)
-    fig2.suptitle("各 backend 实际下发的加速控制参数随决策步")
+    fig2.suptitle("Speed-control params issued per backend, vs decision step")
     fig2.tight_layout()
     fig2.savefig(os.path.join(out_dir, "compare_knob.png"), dpi=120)
     plt.close(fig2)

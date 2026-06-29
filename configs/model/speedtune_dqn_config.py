@@ -31,6 +31,11 @@ def get_config():
     config.pi05_assets_dir = os.environ.get("SPEEDTUNE_VLA_ASSETS", "")     # drift norm_stats 所在 assets 目录
     config.pi05_asset_id = os.environ.get("SPEEDTUNE_VLA_ASSET_ID", "")     # 如 "robotwin"
 
+    # --- SpeedTune 执行层力矩底座（真机 ARX5 τ_max）。per-joint 单臂(6), N·m；空串=不施加(∞)=旧行为。
+    #     仅 SpeedTune 读此字段；EXPO/BC config 不含 → 零侵入。learner 端 parse_force_limit 解析后经
+    #     env_creation_request 透传，env 每次 reset 后施加（见 robotwin_env._apply_force_limit）。---
+    config.force_limit = os.environ.get("SPEEDTUNE_FORCE_LIMIT", "30,40,30,15,10,10")
+
     # --- 执行方式（三选一，对应 exec_backends；决定 DQN head 数与动作空间）---
     # "fixed_time"(1 head) / "per_action_toppra"(3 head) / "chunk_toppra"(3 head)
     config.exec_backend = "per_action_toppra"

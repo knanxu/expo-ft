@@ -73,7 +73,7 @@ async def _handle_environment_request(websocket: _server.ServerConnection):
                     env_kwargs["is_eval"] = (env_usage == "eval")
                     # SpeedTune：透传执行后端参数（train 端 env_creation_request 里带；RoboTwinEnv
                     # 显式收 exec_backend，k_skip/stream_hold_steps 走 **kwargs）。
-                    for _sk in ("exec_backend", "k_skip", "stream_hold_steps"):
+                    for _sk in ("exec_backend", "k_skip", "stream_hold_steps", "force_limit"):
                         if request.get(_sk) is not None:
                             env_kwargs[_sk] = request[_sk]
                     env = task_config.env(**env_kwargs)

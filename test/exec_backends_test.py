@@ -3,7 +3,7 @@
     python -m expo_ft.speedtune.exec_backends_test
 """
 
-from expo_ft.speedtune.exec_backends import build_backend, list_backends
+from expo_ft.speedtune.exec_backends import build_backend, list_backends, parse_force_limit
 
 
 def test_head_sizes():
@@ -16,11 +16,18 @@ def test_head_sizes():
         assert all(n >= 1 for n in b.head_sizes)
 
 
+def test_per_action_vars_renamed_absolute():
+    # 绝对值制: vel_scale/acc_scale -> vel_limit/acc_limit（直接 rad/s, rad/s^2）
+    assert [v.name for v in build_backend("per_action_toppra").vars] == ["v", "vel_limit", "acc_limit"]
+    assert [v.name for v in build_backend("chunk_toppra").vars] == ["v", "vel_limit", "acc_limit"]
+    assert [v.name for v in build_backend("fixed_time").vars] == ["v"]   # fixed_time 不变
+
+
 def test_decode_lengths():
     b = build_backend("per_action_toppra")
     idxs = [0] * b.n_heads
     sp, v = b.decode(idxs)
-    assert set(sp.keys()) == {"v", "vel_scale", "acc_scale"}   # RoboTwin take_chunk_action_backend 参数
+    assert set(sp.keys()) == {"v", "vel_limit", "acc_limit"}   # 绝对值制: 直接传 take_chunk_action_per_action
     assert len(v) == b.n_heads
 
 
@@ -28,7 +35,7 @@ def test_aggressiveness_direction():
     b = build_backend("per_action_toppra")
     vmap = {var.name: var for var in b.vars}
     # 全部 faster_is="larger"（v/vel/acc 越大越快）：最大档 aggressiveness=1，最小档=0
-    for name in ("v", "vel_scale", "acc_scale"):
+    for name in ("v", "vel_limit", "acc_limit"):
         var = vmap[name]
         assert var.faster_is == "larger"
         assert var.aggressiveness(int(max(range(var.n_bins), key=lambda i: var.grid[i]))) == 1.0
@@ -71,6 +78,22 @@ def test_reward_override():
     # v=1（最激进）→ speed = 3*1^2 = 3
     _, v = b.decode([max(range(var.n_bins), key=lambda i: var.aggressiveness(i))])
     assert abs(b.speed_reward(True, v) - 3.0) < 1e-9
+
+
+def test_parse_force_limit_str():
+    assert parse_force_limit("30,40,30,15,10,10") == [30.0, 40.0, 30.0, 15.0, 10.0, 10.0]
+
+
+def test_parse_force_limit_empty_and_none():
+    assert parse_force_limit("") is None
+    assert parse_force_limit("   ") is None
+    assert parse_force_limit(None) is None
+
+
+def test_parse_force_limit_list_tuple_and_spaces():
+    assert parse_force_limit([30, 40]) == [30.0, 40.0]
+    assert parse_force_limit((30.0, 40.0)) == [30.0, 40.0]
+    assert parse_force_limit("30, 40 ,30") == [30.0, 40.0, 30.0]
 
 
 def main():

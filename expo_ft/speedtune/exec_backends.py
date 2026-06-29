@@ -5,12 +5,12 @@ RainbowDQN head（BDQ 风格）。一个变量 = 一组离散档位（grid），
 argmax 选一档；总 bin 数 = Σ Nᵢ（相加）而非 Π Nᵢ（相乘）。
 
   - 方式1 ``fixed_time``        : 1 变量 v —— RoboTwin streaming（论文式固定时长，reconstruct(v)）。
-  - 方式2 ``per_action_toppra`` : 3 变量 —— v + TOPPRA vel_scale + acc_scale（RoboTwin per_action，逐 action TOPP）。
-  - 方式3 ``chunk_toppra``      : 3 变量 —— v + TOPPRA vel_scale + acc_scale（RoboTwin whole_chunk，整段 TOPPRA）。
+  - 方式2 ``per_action_toppra`` : 3 变量 —— v + vel_limit + acc_limit（RoboTwin per_action，逐 action TOPP）。
+  - 方式3 ``chunk_toppra``      : 3 变量 —— v + vel_limit + acc_limit（RoboTwin whole_chunk，整段 TOPPRA）。
 
-动作空间值对齐 RoboTwin `take_chunk_action_backend`（v=chunk 压缩比∈[1,4]，vel/acc_scale=TOPPRA 约束
-倍率∈[1,3]，钳在物理天花板 3.0）。decode 出的 speed_params 直接传该后端；reward 里的 vᵢ 是各档位
-归一化激进度∈[0,1]（与真实值解耦），保证 success-gated reward 防 hacking。
+动作空间值绝对值制（v=chunk 压缩比∈[1,4]；vel_limit/acc_limit=绝对关节速度/加速度上限 rad/s·rad/s²，
+≤真机、执行层钳 PHYS_CEIL）。decode 出的 speed_params 直接传 take_chunk_action_per_action；reward 里的
+vᵢ 是各档位归一化激进度∈[0,1]（与真实值解耦），保证 success-gated reward 防 hacking。
 
 reward（防 reward hacking，success-gated）：
 
@@ -25,7 +25,7 @@ reward（防 reward hacking，success-gated）：
 """
 
 import dataclasses
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -35,7 +35,7 @@ class SpeedVar:
     """一个速度控制变量 = 一个 DQN head。
 
     Attributes:
-      name:      变量名（也是 ``speed_params`` 的 key），如 "compress"/"vel_scale"/"acc_scale"。
+      name:      变量名（也是 ``speed_params`` 的 key），如 "v"/"vel_limit"/"acc_limit"。
       grid:      离散档位值（下发给 env 的真实参数值）。len(grid) = 该 head 的输出维度 Nᵢ。
       faster_is: "smaller" 表示档位值越小越快（如 compress 压缩率），"larger" 表示越大越快
                  （如 vel/acc scale）。决定归一化激进度 ``v`` 的方向。
@@ -133,12 +133,13 @@ class ExecBackend:
 # 默认动作空间（可被 config 覆盖；见 configs/model/speedtune_dqn_config.py）
 # ---------------------------------------------------------------------------
 
-# RoboTwin 真实速度参数（对接 take_chunk_action_backend）。
+# RoboTwin 真实速度参数（绝对值制：vel_limit/acc_limit 直接是关节上限，对接 take_chunk_action_per_action）。
 # v = chunk 压缩比 ∈[1,4]（reconstruct_chunk: 1=原速，越大帧数越少=越快）。faster_is="larger"。
 _DEFAULT_V = (1.0, 1.5, 2.0, 3.0, 4.0)
-# vel/acc_scale = TOPPRA 约束倍率 ∈[1,3]（base 1.0×scale，钳在物理天花板 3.0 rad/s·rad/s²）。越大越快。
-_DEFAULT_VEL_SCALE = (1.0, 1.5, 2.0, 3.0)
-_DEFAULT_ACC_SCALE = (1.0, 1.5, 2.0, 3.0)
+# vel_limit = 绝对关节速度上限 (rad/s, ≤真机 5~5.5)；acc_limit = 绝对加速度上限 (rad/s²)。越大越快。
+# 占位值：Task 6 (calibrate_acc_grid) 标定后回填 acc_limit；vel_limit 按真机速度定。
+_DEFAULT_VEL_LIMIT = (1.0, 2.0, 3.0)
+_DEFAULT_ACC_LIMIT = (1.0, 3.0, 5.0, 7.0, 9.0)
 
 
 def _default_specs() -> Dict[str, dict]:
@@ -152,17 +153,17 @@ def _default_specs() -> Dict[str, dict]:
         "fixed_time": {
             "v": dict(grid=_DEFAULT_V, faster_is="larger", alpha=1.0, beta=1.0),
         },
-        # 方式2 per_action_toppra（RoboTwin per_action，逐 action TOPP）：v + vel + acc。
+        # 方式2 per_action_toppra（RoboTwin per_action，逐 action TOPP）：v + vel_limit + acc_limit。
         "per_action_toppra": {
             "v": dict(grid=_DEFAULT_V, faster_is="larger", alpha=0.5, beta=1.0),
-            "vel_scale": dict(grid=_DEFAULT_VEL_SCALE, faster_is="larger", alpha=0.5, beta=1.0),
-            "acc_scale": dict(grid=_DEFAULT_ACC_SCALE, faster_is="larger", alpha=0.5, beta=1.0),
+            "vel_limit": dict(grid=_DEFAULT_VEL_LIMIT, faster_is="larger", alpha=0.5, beta=1.0),
+            "acc_limit": dict(grid=_DEFAULT_ACC_LIMIT, faster_is="larger", alpha=0.5, beta=1.0),
         },
-        # 方式3 chunk_toppra（RoboTwin whole_chunk，整段 TOPPRA）：v + vel + acc。
+        # 方式3 chunk_toppra（RoboTwin whole_chunk，整段 TOPPRA）：v + vel_limit + acc_limit。
         "chunk_toppra": {
             "v": dict(grid=_DEFAULT_V, faster_is="larger", alpha=0.5, beta=1.0),
-            "vel_scale": dict(grid=_DEFAULT_VEL_SCALE, faster_is="larger", alpha=0.5, beta=1.0),
-            "acc_scale": dict(grid=_DEFAULT_ACC_SCALE, faster_is="larger", alpha=0.5, beta=1.0),
+            "vel_limit": dict(grid=_DEFAULT_VEL_LIMIT, faster_is="larger", alpha=0.5, beta=1.0),
+            "acc_limit": dict(grid=_DEFAULT_ACC_LIMIT, faster_is="larger", alpha=0.5, beta=1.0),
         },
     }
 
@@ -194,3 +195,21 @@ def build_backend(name: str, overrides: Dict[str, dict] = None) -> ExecBackend:
         merged["grid"] = tuple(float(x) for x in merged["grid"])
         out_vars.append(SpeedVar(name=var_name, **merged))
     return ExecBackend(name=name, vars=tuple(out_vars))
+
+
+def parse_force_limit(spec) -> Optional[List[float]]:
+    """force_limit 配置 → per-joint 单臂力矩上限 list（空/None → None = 不施加 = ∞）。
+
+    接受逗号分隔字符串 "30,40,30,15,10,10" / list / tuple；空串、纯空白、None → None。
+    长度应 = 单臂 arm dof（6, ARX5）；不强制校验——由 RoboTwinEnv._apply_force_limit 的 zip
+    自然处理（多余截断、不足只设前 N 个关节）。SpeedTune 执行层力矩底座用，EXPO/BC 不传 → None。
+    """
+    if spec is None:
+        return None
+    if isinstance(spec, (list, tuple)):
+        vals = [float(x) for x in spec]
+        return vals or None
+    s = str(spec).strip()
+    if not s:
+        return None
+    return [float(x) for x in s.split(",") if x.strip()]

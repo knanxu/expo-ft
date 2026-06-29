@@ -37,7 +37,7 @@ from expo_ft.utils.train_utils import init_logging, init_wandb
 
 from expo_ft.agents.alg.speedtune_dqn import SpeedTuneLearner
 from expo_ft.data.speedtune_buffer import SpeedTuneReplayBuffer
-from expo_ft.speedtune.exec_backends import build_backend
+from expo_ft.speedtune.exec_backends import build_backend, parse_force_limit
 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -195,7 +195,8 @@ def main(_):
                               # SpeedTune：env 创建即设执行后端（RoboTwin take_chunk_action_backend 用）。
                               "exec_backend": str(config.exec_backend),
                               "k_skip": config.get("k_skip", None),
-                              "stream_hold_steps": int(config.get("stream_hold_steps", 15))},
+                              "stream_hold_steps": int(config.get("stream_hold_steps", 15)),
+                              "force_limit": parse_force_limit(config.get("force_limit", ""))},
         host=FLAGS.client_host, port=FLAGS.client_port,
     )
     env.reset()

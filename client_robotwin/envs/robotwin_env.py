@@ -67,6 +67,10 @@ class RoboTwinEnv:
         _ks = kwargs.get("k_skip", None)
         self._k_skip = int(_ks) if _ks not in (None, "", 0) else None
         self._eval_vsf = int(kwargs.get("eval_video_save_freq", 25) or 25)  # eval 视频每 N 物理步采 1 帧
+        # SpeedTune 执行层力矩底座（真机 τ_max）。None=∞=原行为（EXPO/BC 零侵入）。
+        # 可传标量（所有 arm 关节同）或 per-joint list（长度=单臂 arm dof）。
+        _fl = kwargs.get("force_limit", None)
+        self._force_limit = _fl if _fl not in (None, "", 0) else None
         # 自动专家介入（替代 DROID 人类在环）：用到 takeover_step_frac·step_budget 预算仍未 success →
         # 从当前状态调 play_once 录专家带逐 step 回放（action_type="human"）。EXPO/BC 通用，零侵入。
         self._takeover_enable = bool(kwargs.get("takeover_enable", True))
@@ -232,6 +236,7 @@ class RoboTwinEnv:
         # 而非固定 fallback "stack the two blocks"——否则语言条件与训练/eval 不符 → rollout 必失败。
         self._instruction = self._create_instruction()
         self.env.set_instruction(instruction=self._instruction)
+        self._apply_force_limit()   # SpeedTune 力矩底座（None=不施加，EXPO/BC 零侵入）
         self._steps_since_reset = 0
         self._success_once = False
         self._takeover_active = False
@@ -312,6 +317,29 @@ class RoboTwinEnv:
         # RoboTwin take_action 不返回改写后的动作；executed = 下发的 qpos 目标。
         return {"executed_action": a, "action_type": "policy"}
 
+    def _apply_force_limit(self):
+        """对左右臂 arm 关节施加 PD force_limit（真机 τ_max 物理底座）。
+
+        None → 不施加（默认 ∞，EXPO/BC 零侵入）。不改 robot.py：在 env 层重设
+        set_drive_property，覆盖 force_limit，stiffness/damping 沿用 robot 已设值。
+        每次 reset 后调用（setup_demo 重建 robot 会重置 drive property）。
+        """
+        if self._force_limit is None:
+            return
+        robot = getattr(self.env, "robot", None)
+        if robot is None:
+            return
+        try:
+            arms = [(robot.left_arm_joints, robot.left_joint_stiffness, robot.left_joint_damping),
+                    (robot.right_arm_joints, robot.right_joint_stiffness, robot.right_joint_damping)]
+            for joints, stiff, damp in arms:
+                fl = self._force_limit
+                fl_list = fl if isinstance(fl, (list, tuple)) else [float(fl)] * len(joints)
+                for j, jf in zip(joints, fl_list):
+                    j.set_drive_property(stiffness=stiff, damping=damp, force_limit=float(jf))
+        except Exception:
+            logging.exception("[RoboTwin] apply force_limit failed (继续不限力矩)")
+
     # ---- SpeedTune 整段执行（新增，不改既有 per-action step）---------------
     # exec_backend 名 → RoboTwin 三后端（envs/_base_task.py）方法选择。
     _RT_BACKEND = {
@@ -338,11 +366,11 @@ class RoboTwinEnv:
         """整段执行一个 action chunk + 速度控制参数（SpeedTune 决策粒度）。
 
         直接对接 RoboTwin 已内置的三种执行后端：chunk 压缩由 RoboTwin 的 ``reconstruct_chunk(v)``
-        内部完成，本适配器**只透传** v/vel_scale/acc_scale（不再自行压缩）。
+        内部完成，本适配器**只透传** v/vel_limit/acc_limit（不再自行压缩）。
 
         Args:
           chunk:        ``[H, n_real_dims]`` 绝对 qpos 目标序列（原始，不压缩）。
-          speed_params: {"v": 压缩比∈[1,4], "vel_scale": ∈[1,3], "acc_scale": ∈[1,3]}（见 exec_backends）。
+          speed_params: {"v": 压缩比∈[1,4], "vel_limit": 绝对 rad/s, "acc_limit": 绝对 rad/s²}（见 exec_backends）。
           exec_backend: "fixed_time"/"per_action_toppra"/"chunk_toppra"；缺省用 self.exec_backend。
         Returns:
           {"executed_action": 最后一帧 qpos, "n_exec_steps": 实际仿真帧数(dense_steps),
@@ -357,8 +385,8 @@ class RoboTwinEnv:
             chunk = chunk[None]
         chunk = chunk[:, : self.n_real_dims]
         v = float(speed_params.get("v", 1.0))
-        vel_scale = float(speed_params.get("vel_scale", 1.0))
-        acc_scale = float(speed_params.get("acc_scale", 1.0))
+        vel_limit = float(speed_params.get("vel_limit", 5.0))
+        acc_limit = float(speed_params.get("acc_limit", 10.0))
         vsf = self._eval_vsf if getattr(self.env, "eval_video_path", None) else -1  # eval 视频开着时 >0
 
         if rt == "streaming":
@@ -367,11 +395,11 @@ class RoboTwinEnv:
                                       max_actions=self._k_skip, video_save_freq=vsf)
         elif rt == "per_action":
             info = self._call_backend(self.env.take_chunk_action_per_action, chunk,
-                                      vel_scale=vel_scale, acc_scale=acc_scale, v=v,
+                                      vel_limit=vel_limit, acc_limit=acc_limit, v=v,
                                       max_actions=self._k_skip, video_save_freq=vsf)
         else:  # whole_chunk：整段 TOPPRA，k_skip 不适用
             info = self._call_backend(self.env.take_chunk_action, chunk,
-                                      vel_scale=vel_scale, acc_scale=acc_scale, v=v,
+                                      vel_limit=vel_limit, acc_limit=acc_limit, v=v,
                                       video_save_freq=vsf)
         info = info or {}
         # episode 预算按消耗的 action 数累加（与 RoboTwin step_lim 同语义；后端内部也自查 step_lim）。
