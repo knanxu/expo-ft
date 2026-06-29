@@ -181,6 +181,10 @@ def main(_):
     os.makedirs(log_dir, exist_ok=True)
     init_wandb(epath.Path(log_dir), FLAGS.resume, FLAGS.project_name, FLAGS.run_name)
     wandb.config.update(FLAGS.flag_values_dict(), allow_val_change=FLAGS.resume)
+    # wandb 横轴：所有 log 统一用决策步 step=it 做底层基准（同 step 多次 log 合并→不爆点）；
+    # rollout/* 改用 episode 轴（define_metric），training/action/exec 用决策步轴。
+    wandb.define_metric("episode")
+    wandb.define_metric("rollout/*", step_metric="episode")
 
     # SpeedTune 是在线 RL，无需离线数据集；example_action 仅作 env_creation_request 占位
     # （RoboTwin create_env 不消费它，动作空间由 n_real_dims 决定）。
@@ -214,16 +218,22 @@ def main(_):
 
     batch_size = int(config.batch_size)
     learning_starts = int(config.learning_starts)
-    updates_per_step = int(config.updates_per_step)
+    utd_ratio = int(config.utd_ratio)                    # P: 每次 update 调用的梯度步数
+    update_per_episode = int(config.update_per_episode)  # 每 episode 的 update 调用次数
     max_iters = int(config.max_iters)
+    log_every = 50   # wandb 训练/动作指标按决策步节流（统一 step=it，合并去重，防"一下子十万步"）
 
     # --------------------- async 双线程 --------------------- #
     _buf_lock = threading.Lock()
     _published = [None]
     _publish_lock = threading.Lock()
     _stop = threading.Event()
-    _step = [0]          # 全局决策步计数（epsilon/beta schedule）
+    _step = [0]          # 全局决策步计数（epsilon/beta schedule + 统一 wandb step）
     _n_updates = [0]
+    _episode = [0]                       # 已完成 episode 数（rollout 横轴）
+    _train_metrics = [None]              # update 线程暂存最新聚合 metrics，主线程统一 log(step=it)
+    _can_update = threading.Event()      # buffer ready 才开 update（前期不空转）
+    _new_episode = threading.Event()     # 每 episode 末放行一批 update（per-episode 控速）
 
     def _publish(lr):
         with _publish_lock:
@@ -237,27 +247,35 @@ def main(_):
         return actor_lr.replace(q_net=actor_lr.q_net.replace(params=pub))
 
     def _update_worker():
+        """P 方式 + per-episode 控速：每 episode 末做 update_per_episode 次 update 调用，每次
+        utd_ratio 个梯度步（各自 PER 采样 + 回写优先级）→ 每 episode 共 update_per_episode×utd_ratio
+        个梯度步。metrics 聚合后交主线程统一 log(step=it)，不在本线程 log（避免多线程 step 冲突）。"""
         learner_lr = learner
+        _can_update.wait()                                  # buffer 未 ready 前阻塞，不空转
         while not _stop.is_set():
-            if not buffer.ready(learning_starts):
-                time.sleep(0.2)
+            if not _new_episode.wait(timeout=1.0):          # 等一个完整 episode 的数据（控速 + 防 stale）
                 continue
+            _new_episode.clear()
             beta = _beta_at(_step[0], config)
-            metrics = {}
-            for _ in range(updates_per_step):
-                with _buf_lock:
-                    batch = buffer.sample(batch_size, beta=beta)
-                learner_lr, td, metrics = learner_lr.update(batch)
-                with _buf_lock:
-                    buffer.update_priorities(batch["tree_indices"], np.asarray(td))
-                _n_updates[0] += 1
-            _publish(learner_lr)
-            log_d = {f"training/{k}": float(v) for k, v in metrics.items()
-                     if np.isscalar(v) or (hasattr(v, "ndim") and v.ndim == 0)}
-            log_d["training/per_beta"] = beta
-            log_d["training/n_updates"] = _n_updates[0]
-            log_d["decision_step"] = _step[0]   # 作图 x 轴（多线程不传 wandb step，避免非单调丢点）
-            wandb.log(log_d)
+            agg = []
+            for _ in range(update_per_episode):             # 每 episode update_per_episode 次 update 调用
+                for _ in range(utd_ratio):                  # P: 每次调用 utd_ratio 个梯度步
+                    with _buf_lock:
+                        batch = buffer.sample(batch_size, beta=beta)
+                    learner_lr, td, metrics = learner_lr.update(batch)
+                    with _buf_lock:
+                        buffer.update_priorities(batch["tree_indices"], np.asarray(td))
+                    _n_updates[0] += 1
+                    agg.append(metrics)
+                _publish(learner_lr)                        # 每次调用后发布参数给 actor
+            # 聚合本 episode 全部梯度步 metrics（均值），交主线程统一 log(step=it)。
+            keys = [k for k, v in agg[0].items()
+                    if np.isscalar(v) or getattr(v, "ndim", 1) == 0]
+            tm = {f"training/{k}": float(np.mean([float(m[k]) for m in agg])) for k in keys}
+            tm["training/per_beta"] = beta
+            tm["training/n_updates"] = _n_updates[0]
+            tm["training/replay_ratio"] = _n_updates[0] / max(_step[0], 1)
+            _train_metrics[0] = tm
             if FLAGS.checkpoint_model and FLAGS.checkpoint_interval > 0 \
                     and _n_updates[0] % FLAGS.checkpoint_interval == 0:
                 _save_checkpoint(log_dir, learner_lr, _n_updates[0])
@@ -318,17 +336,24 @@ def main(_):
                                 duration=float(exec_info.get("duration", 0.0)),
                                 n_exec=int(exec_info.get("n_exec_steps", 0))))
 
-            # 每隔若干步记录 DQN 选的速度档 + 真实执行效果（看选档分布与加速是否真省时）。
-            if it % 20 == 0:
+            # 每 log_every 决策步统一 log（step=it）：action/exec + 最新 training metrics 合并到同一 step。
+            if it % log_every == 0:
                 sp_log = {f"action/{k}": float(val) for k, val in speed_params.items()}
                 sp_log["exec/dense_steps"] = int(exec_info.get("n_exec_steps", 0))
                 sp_log["exec/duration_s"] = float(exec_info.get("duration", 0.0))
-                sp_log["decision_step"] = it
-                wandb.log(sp_log)
+                if _train_metrics[0] is not None:
+                    sp_log.update(_train_metrics[0])   # 训练 metrics 合并到决策步轴
+                wandb.log(sp_log, step=it)
 
             obs = env.reset() if done else env.get_observation()
             if done:
                 _flush_episode()
+                _episode[0] += 1
+                # buffer ready 后：开 update 线程 + 放行本 episode 的 update_per_episode×utd_ratio 个梯度步。
+                if buffer.ready(learning_starts):
+                    if not _can_update.is_set():
+                        _can_update.set()
+                    _new_episode.set()
                 if ep_returns:
                     fb_rate = _fallbacks[0] / max(_fallbacks[1], 1)
                     wandb.log({"rollout/success_rate": float(np.mean(ep_returns[-50:])),
@@ -338,10 +363,13 @@ def main(_):
                                "rollout/fallback_rate": float(fb_rate),
                                "rollout/epsilon": _epsilon_at(it, config),
                                "rollout/buffer_size": len(buffer),
-                               "decision_step": it})
+                               "episode": _episode[0]},      # rollout 横轴 = episode
+                              step=it)
     finally:
         _flush_episode()
         _stop.set()
+        _can_update.set()     # 解除 update 线程 _can_update.wait() 阻塞（buffer 从未 ready 的边界）
+        _new_episode.set()    # 解除 _new_episode.wait() 阻塞，让线程跑完 final checkpoint
         _thread.join(timeout=120)
         logging.info("SpeedTune async training finished after %d decision steps.", _step[0])
 

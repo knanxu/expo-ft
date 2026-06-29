@@ -31,7 +31,7 @@ PYTHON="${PYTHON:-uv run python}"
 TASK_CONFIG="${TASK_CONFIG:-configs/task/robotwin_stack_blocks.py}"
 MODEL_CONFIG="${MODEL_CONFIG:-configs/model/speedtune_dqn_config.py}"
 WANDB_PROJECT="${WANDB_PROJECT:-expo-ft-speedtune}"
-MAX_ITERS="${MAX_ITERS:-100000}"
+MAX_ITERS="${MAX_ITERS:-40000}"          # training step = 一次 chunk 执行(决策步)
 SEED="${SEED:-42}"
 SERVER_WAIT="${SERVER_WAIT:-45}"
 TRAIN_MEM_FRAC="${TRAIN_MEM_FRAC:-0.85}"

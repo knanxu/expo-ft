@@ -76,7 +76,10 @@ def get_config():
     config.buffer_capacity = 100000
     config.batch_size = 64
     config.learning_starts = 1000        # buffer 攒够多少决策步才开始训
-    config.updates_per_step = 1          # 每个决策步训几次 DQN
+    # P 方式 replay（值据 expo-ft 论文超参确定）：每 episode 末做 update_per_episode 次 update 调用，
+    # 每次 utd_ratio 个梯度步 → 每 episode 共 update_per_episode×utd_ratio 个梯度步。
+    config.utd_ratio = 20                # 每次 update 调用的梯度步数（P: 循环 utd_ratio 次 learner.update）
+    config.update_per_episode = 6        # 每 episode 的 update 调用次数
     config.target_update_period = 1      # 软更新每步做；>1 时改周期硬更新（train 脚本支持）
 
     # --- reward 统一覆盖钮（None=用 exec_backends 各变量默认 α/β）---
@@ -85,7 +88,7 @@ def get_config():
     config.reward_beta = config_dict.placeholder(float)
 
     # --- 杂项 ---
-    config.max_iters = 100000            # 总决策步预算
+    config.max_iters = 40000             # training step = 一次 chunk 执行(决策步)，跑 40000 个
     config.seed = 0
 
     return config
