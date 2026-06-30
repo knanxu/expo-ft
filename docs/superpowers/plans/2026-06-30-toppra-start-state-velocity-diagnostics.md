@@ -260,3 +260,109 @@ git diff --check
 ```
 
 Expected: pytest exits zero and `git diff --check` emits no errors.
+
+### Task 4: Restore per-action zero-velocity boundaries
+
+**Files:**
+- Create: `/home/xukainan/RoboTwin/envs/per_action_zero_boundary_test.py`
+- Modify: `/home/xukainan/RoboTwin/envs/_base_task.py:1974-2159`
+
+- [ ] **Step 1: Write a failing boundary test**
+
+Construct a fake `Base_Task` with two non-degenerate actions and monkeypatch `retime_chunk` to
+capture every `sd_start`/`sd_end`. Return a one-step valid dense trajectory so the real per-action
+loop executes both actions. Assert every captured pair equals `(0.0, 0.0)`.
+
+- [ ] **Step 2: Verify RED**
+
+```bash
+cd /home/xukainan/RoboTwin
+LC_ALL=C.UTF-8 /home/xukainan/miniforge3/envs/RoboTwin/bin/python -m pytest \
+  envs/per_action_zero_boundary_test.py -q
+```
+
+Expected: assertion failure because the current method computes non-zero `sd_end`.
+
+- [ ] **Step 3: Make the minimal implementation change**
+
+Keep current qpos selection and degenerate-segment detection, but pass fixed boundaries to
+`retime_chunk`:
+
+```python
+sd_start = 0.0
+sd_end = 0.0
+```
+
+Do not modify whole-chunk, fixedtime, `get_obs`, `k_skip`, or constraint values.
+
+- [ ] **Step 4: Verify GREEN and regressions**
+
+```bash
+cd /home/xukainan/RoboTwin
+LC_ALL=C.UTF-8 /home/xukainan/miniforge3/envs/RoboTwin/bin/python -m pytest \
+  envs/per_action_zero_boundary_test.py \
+  envs/whole_chunk_start_state_test.py \
+  envs/robot/toppra_chunk_executor_test.py -q
+```
+
+- [ ] **Step 5: Commit the isolated behavior change**
+
+```bash
+git add envs/_base_task.py envs/per_action_zero_boundary_test.py
+git commit -m "fix(toppra): restore zero per-action boundaries"
+```
+
+### Task 5: Re-run the four-limit expert comparison
+
+**Files:**
+- Produce: `/home/xukainan/expo-ft/scripts/bench_out/toppra_episode_dynamics_zero_boundary/`
+
+- [ ] **Step 1: Run the unchanged diagnostic collector into a new directory**
+
+```bash
+cd /home/xukainan/RoboTwin
+PYTHONPATH=/home/xukainan/RoboTwin:/home/xukainan/expo-ft LC_ALL=C.UTF-8 \
+  /home/xukainan/miniforge3/envs/RoboTwin/bin/python \
+  /home/xukainan/expo-ft/scripts/diag_toppra_episode_dynamics.py \
+  --task stack_blocks_two --rollout demo_clean --task_config demo_clean \
+  --episode 0 --seed 0 \
+  --output_dir /home/xukainan/expo-ft/scripts/bench_out/toppra_episode_dynamics_zero_boundary
+```
+
+- [ ] **Step 2: Verify all eight traces**
+
+Reload every NPZ/JSON and assert 12-column shape, sample count equals `dense_steps`, qacc equals
+`diff(qvel)*250`, tracking error equals `drive_qpos-qpos`, `k_skip is None`, and `v == 1.0`.
+
+### Task 6: Generate fixedtime acceleration diagnostics
+
+**Files:**
+- Create: `/home/xukainan/expo-ft/scripts/plot_fixedtime_acceleration.py`
+- Read: `/home/xukainan/expo-ft/scripts/bench_out/fixedtime_velocity/episode0_v1_force_limited_trace.npz`
+- Read: `/home/xukainan/expo-ft/scripts/bench_out/fixedtime_velocity/episode0_v4_force_limited_trace.npz`
+- Produce: `/home/xukainan/expo-ft/scripts/bench_out/fixedtime_velocity/episode0_fixedtime_acceleration_v1_vs_v4.png`
+- Produce: `/home/xukainan/expo-ft/scripts/bench_out/fixedtime_velocity/episode0_fixedtime_acceleration_per_joint.csv`
+
+- [ ] **Step 1: Load the two existing traces and recompute qacc**
+
+```python
+qacc = np.diff(qvel, axis=0) * 250.0
+assert np.allclose(qacc, stored_qacc)
+```
+
+- [ ] **Step 2: Plot and summarize**
+
+Create two stacked panels for v=1 and v=4 with all six moving left-arm qacc traces over simulation
+time. Write per-joint P95/P99/absolute peak values to CSV.
+
+- [ ] **Step 3: Verify artifacts and syntax**
+
+```bash
+cd /home/xukainan/expo-ft
+/home/xukainan/miniforge3/envs/RoboTwin/bin/python -m py_compile \
+  scripts/plot_fixedtime_acceleration.py
+/home/xukainan/miniforge3/envs/RoboTwin/bin/python \
+  scripts/plot_fixedtime_acceleration.py
+test -s scripts/bench_out/fixedtime_velocity/episode0_fixedtime_acceleration_v1_vs_v4.png
+test -s scripts/bench_out/fixedtime_velocity/episode0_fixedtime_acceleration_per_joint.csv
+```
