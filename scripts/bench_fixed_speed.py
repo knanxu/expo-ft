@@ -98,9 +98,11 @@ def build_frozen_vla(config, config_task, seed, mesh, shardings, env, resume):
     n_real_dims = int(config.n_real_dims)
     resize_size = int(config.pi05_resize_size)
 
+    # init_target=False：bench 纯前向冻结 VLA，不需要 target network；跳过它的第二份完整
+    # train_state，省 ~一半显存（同卡 server+bench 时这正是 OOM 主因）。
     actor, actor_train_state, *_ = build_pi05(
         config, seed, mesh, data_sharding, replicated_sharding,
-        resume, config_task.language_instruction,
+        resume, config_task.language_instruction, init_target=False,
     )
     H = int(actor.model_config.action_horizon)
     A = int(actor.model_config.action_dim)

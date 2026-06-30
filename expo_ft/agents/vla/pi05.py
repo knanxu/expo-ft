@@ -220,12 +220,16 @@ def _jitted_infer(transformed_inputs, train_state, rng, policy_metadata, train, 
 
 
 def build_pi05(config, seed, mesh, data_sharding, replicated_sharding,
-               resume, default_prompt):
+               resume, default_prompt, init_target=True):
     """Build Pi05 actor, train state, target params, and metadata from agent config.
 
     Returns (actor, actor_train_state, target_actor_params, agent_kwargs, metadata)
     where metadata is a dict with action_horizon, resize_size, freeze_encoder
     ready to pass into EXPOLearner/BCLearner.create().
+
+    init_target=False 时跳过 target network 初始化（返回 target_actor_params=None）——纯前向场景
+    （冻结 VLA：bench/eval/SpeedTune 只用 actor 前向）不需要 target，省掉第二份完整 train_state
+    的显存（同卡 server+bench 时避免 OOM）。EXPO/BC 不传 → 默认 True，行为不变（零侵入）。
     """
     from expo_ft.utils.train_utils import build_pi05_config
     agent_kwargs, pi05_train_config, pi05_resize_size, _ = build_pi05_config(config)
@@ -246,7 +250,9 @@ def build_pi05(config, seed, mesh, data_sharding, replicated_sharding,
         freeze_pi05_encoder=freeze_encoder,
         infer_device=jax.devices()[0],
     )
-    if resume:
+    if not init_target:
+        target_actor_params = None      # 纯前向（冻结 VLA）不需要 target，跳过省显存
+    elif resume:
         target_actor_params = actor.get_params(actor_train_state)
     else:
         target_actor_params = actor.init_target_params(target_rng, resume=resume)
