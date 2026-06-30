@@ -16,6 +16,8 @@
 #   export SPEEDTUNE_VLA_ASSET_ID=trossen                 # 选填
 #   bash scripts/run_speedtune_train_eval.sh
 #   冒烟：MAX_ITERS=2000 N_EPISODES=3 bash scripts/run_speedtune_train_eval.sh
+#   指定 backend（≤2，含 chunk_toppra）：BACKENDS="per_action_toppra chunk_toppra" bash scripts/run_speedtune_train_eval.sh
+#   未传 BACKENDS：交互终端会询问；nohup 后台用默认 per_action_toppra chunk_toppra。
 #
 # 跑前清残留（光追退出不彻底会占显存 → cannot create buffer）：
 #   pkill -9 -f run_robotwin_client; pkill -9 -f train_speedtune_async; pkill -9 -f eval_speedtune; sleep 3; nvidia-smi
@@ -48,12 +50,45 @@ export SPEEDTUNE_VLA_CKPT
 export SPEEDTUNE_VLA_ASSETS="${SPEEDTUNE_VLA_ASSETS:-}"
 export SPEEDTUNE_VLA_ASSET_ID="${SPEEDTUNE_VLA_ASSET_ID:-}"
 
-# 两 backend：名 / port / server 卡 / train 卡（与 eval 默认 port 对齐：per_action=8102, fixed_time=8103）。
-BACKENDS=(per_action_toppra fixed_time)
+# 资源池（server 与 train 分卡避免光追 sapien 与 3B VLA 抢显存；与 eval 默认 port 对齐 8102/8103）。
+ALL_BACKENDS=(fixed_time per_action_toppra chunk_toppra)
 PORTS=(8102 8103)
 SERVER_GPUS=(0 2)
 TRAIN_GPUS=(1 3)
 COMPARE_GPU="${COMPARE_GPU:-1}"
+
+# 外露 BACKENDS：训练前传 BACKENDS="A B"（≤2 个，云端只支持 2 个并行）。
+#   已设          → 用之；
+#   未设 + 交互终端 → 列出三选项询问；
+#   未设 + 非交互   → 默认 per_action_toppra chunk_toppra（并打印提示，nohup 后台不卡）。
+if [ -n "${BACKENDS:-}" ]; then
+  read -ra BACKENDS <<< "$BACKENDS"
+elif [ -t 0 ]; then
+  echo "可选执行后端：${ALL_BACKENDS[*]}（云端只支持同时训练 2 个）"
+  read -r -p "请输入要训练的 backend（空格分隔，最多 2 个，回车用默认 per_action_toppra chunk_toppra）：" _line
+  if [ -n "$_line" ]; then read -ra BACKENDS <<< "$_line"; else BACKENDS=(per_action_toppra chunk_toppra); fi
+else
+  BACKENDS=(per_action_toppra chunk_toppra)
+  echo "[*] 未设 BACKENDS 且非交互终端 → 默认: ${BACKENDS[*]}"
+fi
+
+# 校验数量与合法性
+if [ "${#BACKENDS[@]}" -lt 1 ] || [ "${#BACKENDS[@]}" -gt 2 ]; then
+  echo "[ERROR] BACKENDS 必须是 1~2 个（云端只支持 2 个并行），当前(${#BACKENDS[@]}): ${BACKENDS[*]}" >&2
+  exit 1
+fi
+for be in "${BACKENDS[@]}"; do
+  case "$be" in
+    fixed_time|per_action_toppra|chunk_toppra) ;;
+    *) echo "[ERROR] 未知 backend: '$be'（合法: ${ALL_BACKENDS[*]}）" >&2; exit 1 ;;
+  esac
+done
+
+# 按 backend 数切片资源池
+PORTS=("${PORTS[@]:0:${#BACKENDS[@]}}")
+SERVER_GPUS=("${SERVER_GPUS[@]:0:${#BACKENDS[@]}}")
+TRAIN_GPUS=("${TRAIN_GPUS[@]:0:${#BACKENDS[@]}}")
+echo "[*] 训练 backend: ${BACKENDS[*]} | ports: ${PORTS[*]} | server_gpus: ${SERVER_GPUS[*]} | train_gpus: ${TRAIN_GPUS[*]}"
 
 STAMP="$(date +%m%d_%H%M)"
 LOGDIR="${EXPO_ROOT}/logs/speedtune_traineval_${STAMP}"
@@ -124,7 +159,7 @@ for i in "${!BACKENDS[@]}"; do
 done
 
 echo "[*] 训练中（MAX_ITERS=$MAX_ITERS）；只等 train 进程退出（server 常驻待 eval 复用）..."
-echo "[*] 实时查看：tail -f $LOGDIR/train_per_action_toppra.log"
+echo "[*] 实时查看：tail -f $LOGDIR/train_${BACKENDS[0]}.log"
 train_rc=0
 for i in "${!TRAIN_PIDS[@]}"; do
   p="${TRAIN_PIDS[$i]}"; be="${BACKENDS[$i]}"
@@ -135,30 +170,49 @@ if [ "$train_rc" -ne 0 ]; then
   exit 1
 fi
 
-# ---- 3) 自动发现各 backend 最新 checkpoint ----
-CKPT_PER=$(ls -d "$LOGDIR/speedtune_per_action_toppra_${STAMP}/checkpoints/update_"* 2>/dev/null | sort -V | tail -1 || true)
-CKPT_FIXED=$(ls -d "$LOGDIR/speedtune_fixed_time_${STAMP}/checkpoints/update_"* 2>/dev/null | sort -V | tail -1 || true)
-if [ -z "$CKPT_PER" ] || [ -z "$CKPT_FIXED" ]; then
-  echo "[ERROR] 找不到 checkpoint（per_action=$CKPT_PER fixed_time=$CKPT_FIXED）。看 train_*.log" >&2
-  exit 1
-fi
-echo "[*] CKPT per_action_toppra = $CKPT_PER"
-echo "[*] CKPT fixed_time        = $CKPT_FIXED"
+# ---- 3) 自动发现各 backend 最新 checkpoint（循环，与 BACKENDS 对齐）----
+CKPTS=()
+for be in "${BACKENDS[@]}"; do
+  ck=$(ls -d "$LOGDIR/speedtune_${be}_${STAMP}/checkpoints/update_"* 2>/dev/null | sort -V | tail -1 || true)
+  if [ -z "$ck" ]; then
+    echo "[ERROR] 找不到 $be 的 checkpoint。看 $LOGDIR/train_${be}.log" >&2
+    exit 1
+  fi
+  echo "[*] CKPT $be = $ck"
+  CKPTS+=("$ck")
+done
 
-# ---- 4) 起 compare（复用训练 server；A=fixed_time 基准 / B=per_action 被测）----
-echo "[*] 启动对比 eval  compare_GPU=$COMPARE_GPU（复用 server，不重起/不端口预检）"
-CUDA_VISIBLE_DEVICES="$COMPARE_GPU" XLA_PYTHON_CLIENT_MEM_FRACTION="$COMPARE_MEM_FRAC" \
-  $PYTHON eval_speedtune_compare.py \
-    --config "$MODEL_CONFIG" \
-    --config_task "$TASK_CONFIG" \
-    --config.stream_hold_steps "$STREAM_HOLD_STEPS" \
-    --backend_a fixed_time        --ckpt_a "$CKPT_FIXED" --port_a 8103 \
-    --backend_b per_action_toppra --ckpt_b "$CKPT_PER"   --port_b 8102 \
-    --n_episodes "$N_EPISODES" --seed "$SEED" \
-    --max_decision_steps "$MAX_DECISION_STEPS" \
-    --client_host localhost \
-    --output_dir "$OUTPUT_DIR" \
-    2>&1 | tee "$OUTPUT_DIR/compare.log"
+# ---- 4) eval（复用训练 server，不重起/不端口预检）----
+if [ "${#BACKENDS[@]}" -eq 2 ]; then
+  echo "[*] 启动 2 路对比 eval  compare_GPU=$COMPARE_GPU（A=${BACKENDS[0]} / B=${BACKENDS[1]}，复用 server）"
+  CUDA_VISIBLE_DEVICES="$COMPARE_GPU" XLA_PYTHON_CLIENT_MEM_FRACTION="$COMPARE_MEM_FRAC" \
+    $PYTHON eval_speedtune_compare.py \
+      --config "$MODEL_CONFIG" \
+      --config_task "$TASK_CONFIG" \
+      --config.stream_hold_steps "$STREAM_HOLD_STEPS" \
+      --backend_a "${BACKENDS[0]}" --ckpt_a "${CKPTS[0]}" --port_a "${PORTS[0]}" \
+      --backend_b "${BACKENDS[1]}" --ckpt_b "${CKPTS[1]}" --port_b "${PORTS[1]}" \
+      --n_episodes "$N_EPISODES" --seed "$SEED" \
+      --max_decision_steps "$MAX_DECISION_STEPS" \
+      --client_host localhost \
+      --output_dir "$OUTPUT_DIR" \
+      2>&1 | tee "$OUTPUT_DIR/compare.log"
+else
+  be="${BACKENDS[0]}"
+  echo "[*] 单 backend eval（$be）  eval_GPU=$COMPARE_GPU（复用 server）"
+  CUDA_VISIBLE_DEVICES="$COMPARE_GPU" XLA_PYTHON_CLIENT_MEM_FRACTION="$COMPARE_MEM_FRAC" \
+    $PYTHON eval_speedtune.py \
+      --config "$MODEL_CONFIG" \
+      --config.exec_backend "$be" \
+      --config.stream_hold_steps "$STREAM_HOLD_STEPS" \
+      --config_task "$TASK_CONFIG" \
+      --dqn_ckpt "${CKPTS[0]}" \
+      --n_episodes "$N_EPISODES" --seed "$SEED" \
+      --max_decision_steps "$MAX_DECISION_STEPS" \
+      --client_host localhost --client_port "${PORTS[0]}" \
+      --output_dir "$OUTPUT_DIR" \
+      2>&1 | tee "$OUTPUT_DIR/eval_${be}.log"
+fi
 
 echo ""
 echo "[*] 全部完成。训练日志: $LOGDIR ; 对比结果: $OUTPUT_DIR"

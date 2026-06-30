@@ -39,8 +39,9 @@ def get_config():
     # --- 执行方式（三选一，对应 exec_backends；决定 DQN head 数与动作空间）---
     # "fixed_time"(1 head) / "per_action_toppra"(3 head) / "chunk_toppra"(3 head)
     config.exec_backend = "per_action_toppra"
-    # 论文式 frame skip：streaming/per_action 每决策只执行 reconstruct(v) 后前 k_skip 个 action 即重推
-    # VLA（闭环），缩短 MDP horizon。whole_chunk（整段 TOPPRA）忽略此项。None/0=整段。
+    # 论文式 frame skip：每决策只执行 reconstruct(v) 后前 k_skip 个 action 即重推 VLA（闭环），
+    # 缩短 MDP horizon。三种执行方式均生效：streaming/per_action 逐帧；whole_chunk（整段 TOPPRA）
+    # 取前 k_skip 帧做一次整段 TOPPRA。None/0=整段执行。
     config.k_skip = 10
     config.stream_hold_steps = 15        # fixed_time(streaming) 每目标 hold 物理步（250/15≈16.7Hz，对齐采集）
 

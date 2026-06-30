@@ -418,10 +418,10 @@ class RoboTwinEnv:
             info = self._call_backend(self.env.take_chunk_action_per_action, chunk,
                                       vel_limit=vel_limit, acc_limit=acc_limit, v=v,
                                       max_actions=self._k_skip, video_save_freq=vsf)
-        else:  # whole_chunk：整段 TOPPRA，k_skip 不适用
+        else:  # whole_chunk：整段 TOPPRA；k_skip 取前 k 帧再整段重参数化（_call_backend 按签名过滤，向后兼容）
             info = self._call_backend(self.env.take_chunk_action, chunk,
                                       vel_limit=vel_limit, acc_limit=acc_limit, v=v,
-                                      video_save_freq=vsf)
+                                      max_actions=self._k_skip, video_save_freq=vsf)
         info = info or {}
         # episode 预算按消耗的 action 数累加（与 RoboTwin step_lim 同语义；后端内部也自查 step_lim）。
         self._steps_since_reset += int(info.get("take_action_cnt_delta", 0) or 0)
