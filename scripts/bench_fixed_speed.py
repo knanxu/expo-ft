@@ -59,7 +59,8 @@ flags.DEFINE_string(
     "force_limit", None,
     "执行层力矩底座 per-joint N·m。不传=继承 config.force_limit（默认 30,40,30,15,10,10）；"
     "'none'/'off'/'inf'=关掉(∞，纯看速度系数)；或具体 '30,40,30,15,10,10'。")
-flags.DEFINE_boolean("record_video", False, "是否录每 episode 视频（sweep 默认 False，量大不录）。")
+flags.DEFINE_boolean("record_video", False,
+                     "每个配置存一条 episode 视频（baseline v=vel=acc=1 强制存成功的）；4gpu 脚本默认开。")
 flags.DEFINE_string("output_dir", "./logs/bench_fixed_speed", "输出目录（csv/json/png）。")
 flags.DEFINE_string(
     "plot_from_csv", "",
@@ -194,10 +195,19 @@ def resolve_force_limit(flag_val, config):
     return parse_force_limit(flag_val)
 
 
-def run_fixed_config(env, vla, cfg, n_episodes, max_decision_steps, seed, record_video):
+def _cfg_tag(cfg):
+    """配置 → 视频/文件名标签（含具体加速系数）。"""
+    if cfg["backend"] == FIXED_TIME:
+        return f"fixed_time_v{cfg['v']}"
+    return f"per_action_v{cfg['v']}_vel{cfg['vel_limit']}_acc{cfg['acc_limit']}"
+
+
+def run_fixed_config(env, vla, cfg, n_episodes, max_decision_steps, seed, out_dir, record_video):
     """对一个固定 speed_params 配置跑 n_episodes，返回聚合 result dict。
 
     每决策步：冻结 VLA 出 chunk → env.step_chunk(chunk, 固定 speed_params, backend) → get_info_for_step。
+    record_video=True 时每个配置**只存一条** episode 视频（文件名含系数）；**baseline**（v=1 且
+    vel/acc=1）强制存**成功**的那条——失败就删掉继续录下一条，直到拿到成功视频。
     """
     drift_forward = vla["drift_forward"]
     unnormalize = vla["unnormalize"]
@@ -209,10 +219,18 @@ def run_fixed_config(env, vla, cfg, n_episodes, max_decision_steps, seed, record
     rng = np.random.default_rng(seed)   # 固定 seed → 各配置同样的 z 序列（同布局起点尽量可比）
     episodes = []
     n_succ = 0
+    video_dir = os.path.join(out_dir, "videos")
+    cfg_tag = _cfg_tag(cfg)
+    # baseline = 完全不加速（v=1 且 vel/acc 为 1，或 fixed_time 无 vel/acc）→ 视频必须成功。
+    is_baseline = _is(cfg["v"], 1.0) \
+        and (cfg["vel_limit"] is None or _is(cfg["vel_limit"], 1.0)) \
+        and (cfg["acc_limit"] is None or _is(cfg["acc_limit"], 1.0))
+    video_saved = False
 
     for ep in range(n_episodes):
         obs = env.reset()
-        if record_video:
+        rec = record_video and not video_saved   # 每组只存一条；baseline 需成功，失败则继续录下条
+        if rec:
             env.start_video(ep)
         ep_success = False
         dense = 0
@@ -240,8 +258,23 @@ def run_fixed_config(env, vla, cfg, n_episodes, max_decision_steps, seed, record
                 break
             obs = env.get_observation()
 
-        if record_video:
+        if rec:
             env.stop_video()
+            src = os.path.join(video_dir, f"episode{ep}.mp4")
+            keep = ep_success or not is_baseline     # baseline 必须成功；其余任意一条即可
+            if keep and os.path.exists(src):
+                dst = os.path.join(video_dir,
+                                   f"{cfg_tag}_ep{ep}_{'SUCCESS' if ep_success else 'FAIL'}.mp4")
+                try:
+                    os.replace(src, dst)
+                    video_saved = True
+                except Exception:
+                    logging.warning("[%s] video rename 失败(忽略)", cfg_tag)
+            elif os.path.exists(src):
+                try:
+                    os.remove(src)                   # baseline 失败视频 → 删，继续录下条找成功
+                except Exception:
+                    pass
         n_succ += int(ep_success)
         episodes.append(dict(ep=ep, success=bool(ep_success), decision_steps=n_steps,
                              dense_steps=int(dense), sim_time_s=round(sim_t, 4),
@@ -250,6 +283,9 @@ def run_fixed_config(env, vla, cfg, n_episodes, max_decision_steps, seed, record
                      backend, cfg["v"], cfg["vel_limit"], cfg["acc_limit"],
                      ep, ep_success, n_steps, dense, sim_t)
 
+    if record_video and not video_saved:
+        logging.warning("[%s] 未存到合格视频%s", cfg_tag,
+                        "（baseline 全部失败？检查该 ckpt 在不加速下是否真能成功）" if is_baseline else "")
     total_steps = sum(e["decision_steps"] for e in episodes)
     total_fb = sum(e["n_fallback"] for e in episodes)
     return dict(
@@ -298,7 +334,7 @@ def _is(x, val):
 
 
 def plot_results(out_dir, results, subset):
-    """画 fixed_time(v) + per_action(v/vel/acc) 折线：success_rate(左轴) + mean_dense_steps(右轴)。
+    """画 fixed_time(v) + per_action(v/vel/acc) 折线：只看 success_rate vs 各加速系数（点上标数值）。
 
     分片(subset != 'i/1')时本进程结果不完整，仅画本进程有的点并 warning；完整图请合并 csv 后另画。
     """
@@ -323,15 +359,14 @@ def plot_results(out_dir, results, subset):
             return
         xs = [p[xkey] for p in points]
         sr = [100.0 * p["success_rate"] for p in points]
-        ds = [p["mean_dense_steps"] for p in points]
         fig, ax = plt.subplots(figsize=(8, 5))
-        ax.plot(xs, sr, "-o", color="tab:blue", label="success rate (%)")
+        ax.plot(xs, sr, "-o", color="tab:blue")
+        for x, y in zip(xs, sr):                    # 点上标成功率数值
+            ax.annotate(f"{y:.0f}", (x, y), textcoords="offset points", xytext=(0, 6), fontsize=8)
         ax.set_xlabel(xlabel)
-        ax.set_ylabel("success rate (%)", color="tab:blue")
+        ax.set_ylabel("success rate (%)")
         ax.set_ylim(-5, 105)
-        ax2 = ax.twinx()
-        ax2.plot(xs, ds, "--s", color="tab:red", alpha=0.6, label="mean dense steps (exec cost)")
-        ax2.set_ylabel("mean dense steps (lower=faster)", color="tab:red")
+        ax.grid(True, alpha=0.3)
         ax.set_title(title)
         fig.tight_layout()
         fig.savefig(os.path.join(out_dir, fname), dpi=120)
@@ -456,7 +491,7 @@ def main(_):
         # 跑相同 N 个布局。不重建 env → 全程单个 sapien 实例，无显存累积（同卡 server+bench 安全）。
         _reseed_env(env, FLAGS.seed)
         res = run_fixed_config(env, vla, cfg, FLAGS.n_episodes, FLAGS.max_decision_steps,
-                               FLAGS.seed, FLAGS.record_video)
+                               FLAGS.seed, out_dir, FLAGS.record_video)
         results.append(res)
         write_outputs(out_dir, results)   # 增量写盘
         logging.info("---- success=%.1f%% (%d/%d) | mean_dense=%.0f sim=%.2fs | fallback=%.0f%% ----",

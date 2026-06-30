@@ -117,6 +117,7 @@ for i in $(seq 0 $((N_SHARDS - 1))); do
       --n_episodes "$N_EPISODES" --seed "$SEED" \
       --max_decision_steps "$MAX_DECISION_STEPS" \
       --backends "$BACKENDS" --config_subset "$i/$N_SHARDS" \
+      --record_video \
       "${FL_ARG[@]}" \
       --client_host localhost --client_port "$port" \
       --output_dir "$LOGDIR/shard_$i" \
