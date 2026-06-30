@@ -195,9 +195,11 @@ BACKENDS = ("per_action", "whole_chunk")
 ```
 
 At each grid point run per-action then whole-chunk. Write NPZ/CSV/JSON immediately after each
-run and close the scene. If a run has non-finite state or TOPPRA fallback, stop increasing limits.
-Do not treat a measured acceleration above the configured TOPPRA limit as a reason to discard the
-run: that difference is a diagnostic result of PD/contact dynamics and must be reported.
+run and close the scene. Stop increasing limits only if a run has non-finite state. Preserve and
+report TOPPRA fallback counts, but continue the ordered sweep because per-action deliberately falls
+back to its original point-to-point executor and those transitions are part of the backend behavior.
+Do not treat measured acceleration above the configured TOPPRA limit as a reason to discard the run:
+that difference is a diagnostic result of PD/contact dynamics and must be reported.
 
 - [ ] **Step 4: Implement statistics and plots**
 

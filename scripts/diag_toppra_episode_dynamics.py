@@ -400,7 +400,13 @@ def main():
                     f"qacc_max={summary['actual_abs_qacc_rad_s2']['100']:.3f}",
                     flush=True,
                 )
-                stop_after_pair |= summary["nonfinite"] or summary["fallback_count"] > 0
+                stop_after_pair |= summary["nonfinite"]
+                if summary["fallback_count"] > 0:
+                    print(
+                        f"[warning] {tag}: {summary['fallback_count']} TOPPRA fallback(s); "
+                        "retained as diagnostic data and continuing the ordered sweep",
+                        flush=True,
+                    )
                 try:
                     env.close_env(clear_cache=False)
                 except TypeError:
@@ -408,7 +414,7 @@ def main():
             if set(pair) == set(BACKENDS):
                 _plot_timeseries(output_dir, vel_limit, acc_limit, pair)
             if stop_after_pair:
-                print("[stop] non-finite state or TOPPRA fallback; higher limits skipped", flush=True)
+                print("[stop] non-finite state; higher limits skipped", flush=True)
                 break
     finally:
         try:
