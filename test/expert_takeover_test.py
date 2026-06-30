@@ -1,7 +1,7 @@
 """client_robotwin.envs.expert_takeover 单元测试（纯逻辑，不依赖 sapien/RoboTwin）。
 
 ⚠️ 本地显存不足、不跑 pytest；本测试由维护人在**云端**执行：
-    python -m pytest client_robotwin/envs/expert_takeover_test.py -v
+    python -m pytest test/expert_takeover_test.py -v
 """
 
 import numpy as np

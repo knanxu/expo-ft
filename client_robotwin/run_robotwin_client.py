@@ -94,6 +94,18 @@ async def _handle_environment_request(websocket: _server.ServerConnection):
                         response = {"status": "success", "observation": env.reset(), "done": False}
                     await websocket.send(packer.pack(response))
 
+                elif operation == "reseed":
+                    # SpeedTune bench：重置 episode 计数器，下次 reset 从给定 seed 重跑同一批布局
+                    # （免重建 env 累积 sapien scene 显存）。仅 RoboTwinEnv 支持；纯新增不改既有协议。
+                    env = _env_storage.get(request["env_id"])
+                    if env is None:
+                        response = {"status": "error", "message": f"Env {request['env_id']} not found"}
+                    else:
+                        if hasattr(env, "reseed"):
+                            env.reseed(request.get("seed"))
+                        response = {"status": "success"}
+                    await websocket.send(packer.pack(response))
+
                 elif operation == "step":
                     env = _env_storage.get(request["env_id"])
                     if env is None:

@@ -1,0 +1,42 @@
+{
+  "task": "stack_blocks_two",
+  "episode": 0,
+  "seed": 0,
+  "backend": "fixed_time",
+  "v": 1.0,
+  "hold_steps": 15,
+  "physics_hz": 250,
+  "force_limit_nm": null,
+  "success": true,
+  "dense_steps": 4291,
+  "sim_duration_s": 17.164,
+  "wall_s": 23.09057116508484,
+  "actual_abs_velocity_rad_s": {
+    "50": 7.209907926153392e-05,
+    "90": 0.19428346753120426,
+    "95": 0.5180776029825208,
+    "99": 1.3310463666915893,
+    "99.9": 1.8607905032634824,
+    "100": 1.9160528182983398
+  },
+  "actual_abs_acceleration_rad_s2": {
+    "50": 4.0435224946122617e-05,
+    "90": 0.2503339783288538,
+    "95": 0.6294038023042957,
+    "99": 5.744927320629351,
+    "99.9": 42.949173159898066,
+    "100": 474.1295168059878
+  },
+  "tracking_abs_error_rad": {
+    "50": 9.063326615432743e-06,
+    "90": 0.0051567316055297855,
+    "95": 0.008817616105079633,
+    "99": 0.024457280635833738,
+    "99.9": 0.052348186194897256,
+    "100": 0.08979189395904541
+  },
+  "fraction_samples_over_real_joint_vel_limit": 0.0,
+  "fraction_physics_steps_any_joint_over_limit": 0.0,
+  "max_command_fd_velocity_rad_s": 24.14172887802124,
+  "max_drive_velocity_target_rad_s": 1.87873375415802
+}

@@ -245,6 +245,27 @@ class RoboTwinEnv:
         self._ep_count += 1
         return self.get_observation()
 
+    def reseed(self, seed: Optional[int] = None) -> None:
+        """重置 episode 计数器，使下次 reset 从 seed（默认沿用构造 seed）重跑**同一批布局**。
+
+        供固定系数 sweep（scripts/bench_fixed_speed.py）在同批布局上对比多个加速配置——用它代替
+        「重建 env」做控制变量，避免累积 sapien scene 显存（同卡 server+bench 时尤其关键）。
+        主动 close 上一配置遗留的 scene + clear_cache 释放显存；保留已缓存的 episode_info（不重跑
+        play_once）。纯新增，不改既有 reset/step 协议。
+        """
+        try:
+            self.env.close_env(clear_cache=True)
+        except Exception:
+            logging.exception("[RoboTwin] reseed close_env failed (继续)")
+        if seed is not None:
+            self._seed = int(seed)
+        self._ep_count = 0
+        self._steps_since_reset = 0
+        self._success_once = False
+        self._takeover_active = False
+        self._takeover_attempted = False
+        self._replayer = None
+
     def get_observation(self) -> Dict[str, Any]:
         """RoboTwin get_obs → openpi `pi05_aloha_robotwin` RepackTransform 期望的扁平 obs dict。
 

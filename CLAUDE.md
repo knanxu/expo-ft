@@ -71,7 +71,7 @@ drift robotwin openpi config + DBP ckpt），**不改** `expo_ft_pi_config.py`�
   **不改** `pick.py` / `real_base.py` / `expo_ft_pi_config.py` 等既有 config。
 - **新训练入口**：**EXPO/BC + drift + RoboTwin 直接复用现成 `train_pi_robo_async.py`**（`EXPOLearner`/`BCLearner`
   分支，无需新入口）；SpeedTune 用独立 `train_speedtune_async.py`，不在原脚本里破坏 EXPO/BC 的 per-step 路径。
-- **验证不回归**：改动后 SpeedTune 既有测试（`expo_ft/**/​*_test.py`）保持通过，且 `expo_ft.agents.{vla,alg}` 与
+- **验证不回归**：改动后 既有测试（集中在 `test/`，含 SpeedTune 与 RoboTwin）保持通过，且 `expo_ft.agents.{vla,alg}` 与
   EXPO/BC 导入/构造不受影响。
 
 > 历史：曾在本框架上尝试 **DBPO**（用 BPO/PPO 对 drift policy 做 on-policy RL 微调），因与现框架冲突，已于
