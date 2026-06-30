@@ -70,4 +70,41 @@ P50/P95/P99/峰值及速度/加速度越限比例。图表至少包含：
 - 专家回放未启用 `k_skip`，两后端使用完全相同的 episode 和约束参数；
 - CSV/NPZ 的样本数与各后端 `dense_steps` 一致；
 - 所有汇总数值可以从 NPZ 重新计算并通过一致性断言；
-- 不修改 `get_obs()`、专家数据格式或 per-action 执行逻辑。
+- 不修改 `get_obs()` 或专家数据格式；per-action 的后续变更以本文下方修订为准。
+
+## 2026-06-30 修订：per-action 恢复零速度边界
+
+### 范围
+
+- 仅修改 `take_chunk_action_per_action`：每个相邻 action 的两点 TOPPRA 求解固定传入
+  `sd_start=0.0, sd_end=0.0`。
+- 保留当前 qpos 起点语义：每个 chunk 第一段从真实 qpos 开始；后续段仍以上一 action 目标
+  qpos 作为几何起点。
+- 不修改 whole-chunk；其整段 TOPPRA 已经使用 `sd_start=0.0, sd_end=0.0`。
+- 不修改 `get_obs()`、fixedtime、`k_skip`、速度/加速度网格或力矩限制。
+
+### 回归测试
+
+增加 fake-robot 单元测试，拦截 per-action 对 `retime_chunk` 的每次调用。测试先在旧实现上证明
+至少一个 `sd_end` 非零，再验证修改后所有段的 `sd_start` 和 `sd_end` 都严格为零。继续运行
+whole-chunk 起点测试和 `toppra_chunk_executor_test.py`。
+
+### 仿真复测
+
+使用与上一轮完全相同的专家 episode 和参数：episode 0、seed 0、`v=1`、`k_skip=None`、
+每臂力矩限制 `[30,40,30,15,10,10] N·m`，依次运行 `(vel,acc)=(1,1)、(2,2)、
+(3,4)、(5,8)`。per-action 与 whole-chunk 均逐 4 ms 记录真实 qpos/qvel/qacc、规划速度和
+跟踪误差，写入新的 `toppra_episode_dynamics_zero_boundary/`，保留上一轮结果用于前后对比。
+
+### fixedtime 加速度产物
+
+不修改 fixedtime 执行器。直接使用已采集的 episode 0、hold=15、v=1 与 v=4 的真实 qvel，
+按 `qacc[t]=(qvel[t]-qvel[t-1])*250` 生成独立加速度时序图，并输出逐关节 P95/P99/峰值 CSV。
+
+### 修订验收标准
+
+- per-action 每次 `retime_chunk` 的两个边界速度参数均为零；
+- 四档双后端复测产生 8 份完整 CSV/NPZ/JSON 与对应速度、加速度图；
+- 新结果的样本数、qacc 和 tracking error 可以从 NPZ 独立重算并通过一致性断言；
+- fixedtime v=1/v=4 加速度图和逐关节统计可直接用于判断尖峰位置与幅值；
+- whole-chunk、fixedtime 和 `get_obs()` 源码不发生行为修改。
