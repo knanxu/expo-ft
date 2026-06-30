@@ -156,8 +156,27 @@ class SceneProbe:
 - [ ] **Step 2: Implement one-run collection without action truncation**
 
 Use `bench_exec_backends.build_env`, `apply_real_params`, episode 0 HDF5 actions, seed 0,
-and 50-action chunks. Dispatch `take_chunk_action_per_action(..., max_actions=None)` or
-`take_chunk_action(...)`, always with `v=1.0`. Compute:
+and 50-action chunks. Dispatch one of these exact calls, always with `v=1.0`:
+
+```python
+env.take_chunk_action_per_action(
+    chunk,
+    vel_limit=vel_limit,
+    acc_limit=acc_limit,
+    v=1.0,
+    max_actions=None,
+    video_save_freq=-1,
+)
+env.take_chunk_action(
+    chunk,
+    vel_limit=vel_limit,
+    acc_limit=acc_limit,
+    v=1.0,
+    video_save_freq=-1,
+)
+```
+
+Compute:
 
 ```python
 qacc = np.vstack([np.full((1, 12), np.nan), np.diff(qvel, axis=0) * 250.0])
@@ -239,4 +258,3 @@ git diff --check
 ```
 
 Expected: pytest exits zero and `git diff --check` emits no errors.
-
