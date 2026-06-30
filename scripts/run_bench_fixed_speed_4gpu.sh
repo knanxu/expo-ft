@@ -35,7 +35,9 @@ MAX_DECISION_STEPS="${MAX_DECISION_STEPS:-400}"
 SEED="${SEED:-0}"
 FORCE_LIMIT="${FORCE_LIMIT:-}"                      # 空=继承 config 力矩底座(30,40,...)；"none"=关掉(∞)
 SERVER_WAIT="${SERVER_WAIT:-45}"                    # 等 server 渲染自检/就绪秒数
-MEM_FRAC="${MEM_FRAC:-0.5}"                         # bench(jax) 单卡显存上限；留空间给同卡 sapien 光追
+MEM_FRAC="${MEM_FRAC:-0.9}"                         # bench(jax) 单卡显存上限。配合 build_pi05 init_target=False
+                                                   # (省一半显存) 后 0.5 已够；0.9 给足余量，但同卡 sapien
+                                                   # server 只剩 ~10%(4.8GB)，若它报 cannot create buffer 降到 0.7~0.8
 BASE_PORT="${BASE_PORT:-8102}"
 
 # VLA（冻结 drift pi0.5, stack_blocks_two）：默认云端 ckpt 根目录（params/ 与 assets/ 平级，
