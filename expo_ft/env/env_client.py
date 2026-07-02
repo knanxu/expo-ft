@@ -131,6 +131,10 @@ class EnvClient:
         response = self._call_operation("reset", {"env_id": env_id})
         observation = response["observation"]
         return observation, response["done"]
+
+    def reseed(self, env_id: str, seed: int) -> None:
+        """Reset the server-side episode counter for paired evaluation."""
+        self._call_operation("reseed", {"env_id": env_id, "seed": int(seed)})
     
     def step(self, env_id: str, action: np.ndarray) -> Tuple[np.ndarray, str]:
         """Step the environment. Returns (real_executed_action, action_type)."""
@@ -159,7 +163,14 @@ class EnvClient:
             "right_gripper": float(response.get("right_gripper", 0.0)),
             "left_contact": bool(response.get("left_contact", False)),
             "right_contact": bool(response.get("right_contact", False)),
+            "execution_steps": int(response.get("execution_steps", 0)),
+            "planned_cruise_fraction": float(response.get("planned_cruise_fraction", 0.0)),
+            "fixed_time_speed_violation": bool(response.get("fixed_time_speed_violation", False)),
+            "max_planned_qvel": float(response.get("max_planned_qvel", 0.0)),
         }
+        for key in ("vel_limit", "acc_limit"):
+            if key in response:
+                info[key] = float(response[key])
         return executed, info
 
     def start_video(self, env_id: str, episode_id: int = 0) -> None:
@@ -219,6 +230,9 @@ class EnvClientWrapper:
         """Reset the environment and return observation."""
         observation, _ = self._call("reset", lambda: self.client.reset(self.env_id))
         return observation
+
+    def reseed(self, seed: int):
+        return self._call("reseed", lambda: self.client.reseed(self.env_id, seed))
     
     def step(self, action):
         """Step the environment.

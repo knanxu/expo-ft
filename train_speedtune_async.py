@@ -38,6 +38,15 @@ from expo_ft.utils.train_utils import init_logging, init_wandb
 from expo_ft.agents.alg.speedtune_dqn import SpeedTuneLearner
 from expo_ft.data.speedtune_buffer import SpeedTuneReplayBuffer
 from expo_ft.speedtune.exec_backends import build_backend, parse_force_limit
+from expo_ft.speedtune.runtime_config import (
+    backend_k_skip,
+    backend_support,
+    episode_reward_success,
+)
+from expo_ft.speedtune.checkpoint_contract import (
+    build_checkpoint_metadata,
+    write_checkpoint_metadata,
+)
 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -116,10 +125,11 @@ def _setup_speedtune(config, config_task, seed, mesh, shardings, env):
     logging.info("SpeedTune: VLA suffix feat_dim=%d, H=%d, A=%d", feat_dim, H, A)
 
     # exec_backend（含 reward α/β 统一覆盖钮）。
+    backend_name = str(config.exec_backend)
     overrides = None
     ra, rb = config.get("reward_alpha", None), config.get("reward_beta", None)
-    if ra is not None or rb is not None:
-        base = build_backend(str(config.exec_backend))
+    if backend_name in ("fixed_time", "chunk_toppra") and (ra is not None or rb is not None):
+        base = build_backend(backend_name)
         overrides = {}
         for v in base.vars:
             o = {}
@@ -128,12 +138,13 @@ def _setup_speedtune(config, config_task, seed, mesh, shardings, env):
             if rb is not None:
                 o["beta"] = float(rb)
             overrides[v.name] = o
-    backend = build_backend(str(config.exec_backend), overrides)
+    backend = build_backend(backend_name, overrides)
     logging.info("SpeedTune exec_backend=%s head_sizes=%s", backend.name, backend.head_sizes)
+    support_min, support_max = backend_support(config, backend.name)
 
     dqn = SpeedTuneLearner.create(
         rng=jax.random.PRNGKey(seed), feat_dim=feat_dim, head_sizes=backend.head_sizes,
-        n_atoms=int(config.n_atoms), v_min=float(config.v_min), v_max=float(config.v_max),
+        n_atoms=int(config.n_atoms), v_min=support_min, v_max=support_max,
         hidden_dims=tuple(config.q_hidden_dims), dueling=bool(config.dueling),
         detach_input=bool(config.detach_q_input), lr=float(config.q_lr),
         max_grad_norm=float(config.max_grad_norm), tau=float(config.tau),
@@ -198,7 +209,7 @@ def main(_):
                               "video_dir": os.path.join(log_dir, "train_videos"),
                               # SpeedTune：env 创建即设执行后端（RoboTwin take_chunk_action_backend 用）。
                               "exec_backend": str(config.exec_backend),
-                              "k_skip": config.get("k_skip", None),
+                              "k_skip": backend_k_skip(config, str(config.exec_backend)),
                               "stream_hold_steps": int(config.get("stream_hold_steps", 15)),
                               "force_limit": parse_force_limit(config.get("force_limit", ""))},
         host=FLAGS.client_host, port=FLAGS.client_port,
@@ -215,6 +226,7 @@ def main(_):
     learner = setup["dqn"]
     H, A = setup["H"], setup["A"]
     exec_backend = str(config.exec_backend)
+    checkpoint_metadata = build_checkpoint_metadata(config, backend)
 
     batch_size = int(config.batch_size)
     learning_starts = int(config.learning_starts)
@@ -278,8 +290,8 @@ def main(_):
             _train_metrics[0] = tm
             if FLAGS.checkpoint_model and FLAGS.checkpoint_interval > 0 \
                     and _n_updates[0] % FLAGS.checkpoint_interval == 0:
-                _save_checkpoint(log_dir, learner_lr, _n_updates[0])
-        _save_checkpoint(log_dir, learner_lr, _n_updates[0])
+                _save_checkpoint(log_dir, learner_lr, _n_updates[0], checkpoint_metadata)
+        _save_checkpoint(log_dir, learner_lr, _n_updates[0], checkpoint_metadata)
         logging.info("Update thread exiting after %d updates.", _n_updates[0])
 
     _thread = threading.Thread(target=_update_worker, daemon=True)
@@ -290,25 +302,31 @@ def main(_):
     obs = env.get_observation()
     pending = []          # 当前 episode 的决策步（episode 结束统一回填 reward 再入 buffer）
     ep_success = False
-    ep_returns, ep_lens, ep_exec_time, ep_dense = [], [], [], []   # episode 级日志（含真实执行时间）
+    ep_speed_violation = False
+    ep_returns, ep_reward_returns, ep_lens, ep_exec_time, ep_dense = [], [], [], [], []
     _fallbacks = [0, 0]   # [topp_fallback 次数, 总 chunk 次数] → fallback 率
 
     def _flush_episode():
         """episode 结束：success-gated 回填 reward，按时序写入 buffer + 统计执行时间。"""
-        nonlocal pending, ep_success
+        nonlocal pending, ep_success, ep_speed_violation
         if not pending:
             return
+        reward_success = episode_reward_success(
+            backend.name, ep_success, ep_speed_violation
+        )
         with _buf_lock:
             for t, p in enumerate(pending):
                 next_feat = pending[t + 1]["feat"] if t + 1 < len(pending) else p["feat"]
-                r = backend.total_reward(p["r_task"], ep_success, p["v_list"])
+                r = backend.total_reward(p["r_task"], reward_success, p["v_list"])
                 buffer.insert(p["feat"], p["action_idxs"], r, next_feat, p["done"])
         ep_returns.append(bool(ep_success))
+        ep_reward_returns.append(bool(reward_success))
         ep_lens.append(len(pending))
         ep_exec_time.append(float(sum(p["duration"] for p in pending)))   # episode 总 TOPPRA 执行时长(s)
         ep_dense.append(int(sum(p["n_exec"] for p in pending)))           # episode 总仿真帧数
         pending = []
         ep_success = False
+        ep_speed_violation = False
 
     try:
         for it in tqdm.tqdm(range(max_iters), disable=not FLAGS.tqdm):
@@ -328,6 +346,9 @@ def main(_):
             _executed, exec_info = env.step_chunk(real_chunk, speed_params, exec_backend)
             done, success, r_task, _mask = env.get_info_for_step()
             ep_success = ep_success or bool(success)
+            ep_speed_violation = ep_speed_violation or bool(
+                exec_info.get("fixed_time_speed_violation", False)
+            )
             _fallbacks[1] += 1
             if exec_info.get("exec_status") == "topp_fallback":
                 _fallbacks[0] += 1
@@ -341,6 +362,15 @@ def main(_):
                 sp_log = {f"action/{k}": float(val) for k, val in speed_params.items()}
                 sp_log["exec/dense_steps"] = int(exec_info.get("n_exec_steps", 0))
                 sp_log["exec/duration_s"] = float(exec_info.get("duration", 0.0))
+                sp_log["exec/planned_cruise_fraction"] = float(
+                    exec_info.get("planned_cruise_fraction", 0.0)
+                )
+                sp_log["exec/max_planned_qvel"] = float(exec_info.get("max_planned_qvel", 0.0))
+                sp_log["exec/fixed_time_speed_violation"] = float(
+                    bool(exec_info.get("fixed_time_speed_violation", False))
+                )
+                if "acc_limit" in exec_info:
+                    sp_log["action/derived_acc_limit"] = float(exec_info["acc_limit"])
                 if _train_metrics[0] is not None:
                     sp_log.update(_train_metrics[0])   # 训练 metrics 合并到决策步轴
                 wandb.log(sp_log, step=it)
@@ -357,6 +387,7 @@ def main(_):
                 if ep_returns:
                     fb_rate = _fallbacks[0] / max(_fallbacks[1], 1)
                     wandb.log({"rollout/success_rate": float(np.mean(ep_returns[-50:])),
+                               "rollout/reward_success_rate": float(np.mean(ep_reward_returns[-50:])),
                                "rollout/ep_len_mean": float(np.mean(ep_lens[-50:])),
                                "rollout/exec_time_s": float(np.mean(ep_exec_time[-50:])),  # 对比核心：成功 vs 执行时间
                                "rollout/dense_steps": float(np.mean(ep_dense[-50:])),
@@ -374,7 +405,7 @@ def main(_):
         logging.info("SpeedTune async training finished after %d decision steps.", _step[0])
 
 
-def _save_checkpoint(log_dir, learner, step):
+def _save_checkpoint(log_dir, learner, step, metadata):
     try:
         import orbax.checkpoint as ocp
         ckpt_dir = epath.Path(log_dir).resolve() / "checkpoints" / f"update_{step}"
@@ -383,6 +414,7 @@ def _save_checkpoint(log_dir, learner, step):
             # force=True：final 与最后一次 interval 可能撞同一 update_N，覆盖而非报 "already exists"。
             ckptr.save(ckpt_dir / "q_net", learner.q_net.params, force=True)
             ckptr.save(ckpt_dir / "target", learner.target_params, force=True)
+        write_checkpoint_metadata(ckpt_dir, metadata)
         logging.info("Saved SpeedTune DQN checkpoint at update %d", step)
     except Exception as e:
         logging.error("Checkpoint save failed: %s", e)

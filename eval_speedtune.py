@@ -25,6 +25,7 @@ DQN 用 greedy(无探索)。架构同 train：client-learner 分离(VLA/DQN 在 
 import os
 import json
 import logging
+import time
 
 import numpy as np
 import tqdm
@@ -41,6 +42,17 @@ from expo_ft.utils.train_utils import init_logging
 
 from expo_ft.agents.alg.speedtune_dqn import SpeedTuneLearner
 from expo_ft.speedtune.exec_backends import build_backend, parse_force_limit
+from expo_ft.speedtune.runtime_config import (
+    backend_k_skip,
+    backend_support,
+    episode_reward_success,
+)
+from expo_ft.speedtune.paired_eval import noise_seed
+from expo_ft.speedtune.checkpoint_contract import (
+    build_checkpoint_metadata,
+    validate_checkpoint_metadata,
+    WHOLE_CHUNK_ACC_RULE,
+)
 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -48,13 +60,13 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string("dqn_ckpt", None, "训练好的 speedtune DQN checkpoint 目录（含 q_net/，即 update_<N>）。")
-flags.DEFINE_integer("n_episodes", 5, "eval episode 数。")
+flags.DEFINE_integer("n_episodes", 30, "eval episode 数。")
 flags.DEFINE_integer("seed", 0, "Random seed.")
 flags.DEFINE_integer("max_decision_steps", 400, "每 episode 决策步上限（防卡死；env 内部 step_lim 也会终止）。")
 flags.DEFINE_string("output_dir", "./logs/speedtune_eval", "输出目录（视频/json/png）。")
 flags.DEFINE_string("client_host", "localhost", "Env server host.")
 flags.DEFINE_integer("client_port", 8102, "Env server port.")
-flags.DEFINE_boolean("record_video", True, "是否录制 episode 视频（server 端 ffmpeg）。")
+flags.DEFINE_boolean("record_video", False, "是否录制 episode 视频；严格墙钟计时默认关闭。")
 flags.DEFINE_boolean("resume", False, "build_pi05 resume（一般 False）。")
 flags.DEFINE_integer("fsdp_devices", 1, "FSDP devices for sharding（eval VLA 冻结，单卡即可）。")
 
@@ -122,14 +134,19 @@ def _build_dqn(config, seed, exec_backend, dqn_ckpt, feat_dim, vfeat0):
     logging.info("SpeedTune eval DQN: backend=%s head_sizes=%s ckpt=%s",
                  backend.name, backend.head_sizes, dqn_ckpt)
 
+    expected_metadata = build_checkpoint_metadata(config, backend)
+    validate_checkpoint_metadata(dqn_ckpt, expected_metadata)
+    v_min, v_max = backend_support(config, str(exec_backend))
     dqn = SpeedTuneLearner.create(
         rng=jax.random.PRNGKey(seed), feat_dim=feat_dim, head_sizes=backend.head_sizes,
-        n_atoms=int(config.n_atoms), v_min=float(config.v_min), v_max=float(config.v_max),
+        n_atoms=int(config.n_atoms), v_min=v_min, v_max=v_max,
         hidden_dims=tuple(config.q_hidden_dims), dueling=bool(config.dueling),
         detach_input=bool(config.detach_q_input), epsilon=0.0,   # greedy
         example_feat=jnp.asarray(vfeat0),
     )
     dqn = _restore_dqn(dqn, dqn_ckpt)
+    # Exclude one-time JAX compilation from deployment wall-time metrics.
+    np.asarray(dqn.greedy_action_idxs(jnp.asarray(vfeat0)))
     return dict(backend=backend, learner=dqn)
 
 
@@ -214,7 +231,8 @@ def _save_and_plot(out_dir, ep, recs, ep_success=None):
 
 
 def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
-                         n_episodes, max_decision_steps, seed, out_dir, record_video):
+                         n_episodes, max_decision_steps, seed, out_dir, record_video,
+                         k_skip=None):
     """跑 n_episodes（录视频 + 逐 chunk 记录 + 每 episode _save_and_plot），返回聚合 result dict。
 
     Args:
@@ -234,50 +252,89 @@ def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
     drift_forward, unnormalize, preprocess = vla["drift_forward"], vla["unnormalize"], vla["preprocess"]
     H, A = vla["H"], vla["A"]
 
-    rng = np.random.default_rng(seed)
     n_succ = 0
+    n_reward_succ = 0
     all_contact_aggr, all_free_aggr = [], []   # 跨 episode 汇总：接触 vs 非接触时段激进度
     episodes = []
 
+    env.reseed(seed)
     for ep in range(n_episodes):
         obs = env.reset()
         if record_video:
             env.start_video(ep)
-        recs, t_acc, ep_success = [], 0.0, False
+        recs, t_acc, planned_time, ep_success = [], 0.0, 0.0, False
+        ep_speed_violation = False
+        vla_wall = dqn_wall = env_rpc_wall = obs_rpc_wall = 0.0
+        episode_wall_start = time.perf_counter()
 
         for step_i in tqdm.tqdm(range(max_decision_steps), desc=f"{exec_backend} ep{ep}", disable=False):
+            stage_start = time.perf_counter()
             obs_m = preprocess(obs)
-            z = jax.random.normal(jax.random.PRNGKey(int(rng.integers(0, 2**31 - 1))), (1, H, A))
+            z = jax.random.normal(
+                jax.random.PRNGKey(noise_seed(seed, ep, step_i)), (1, H, A)
+            )
             mean, _cond, value_feat = drift_forward(obs_m, z)
             feat = np.asarray(value_feat[0])
             real_chunk = unnormalize(mean, obs_m)
+            vla_step_wall = time.perf_counter() - stage_start
+            vla_wall += vla_step_wall
 
+            stage_start = time.perf_counter()
             idxs = np.asarray(learner.greedy_action_idxs(feat[None])[0], dtype=np.int32)  # greedy 无探索
-            speed_params, v_list = backend.decode(idxs)
+            speed_params, reward_values = backend.decode(idxs)
+            aggr_values = [
+                var.aggressiveness(int(idx)) for var, idx in zip(backend.vars, idxs)
+            ]
+            dqn_step_wall = time.perf_counter() - stage_start
+            dqn_wall += dqn_step_wall
 
+            stage_start = time.perf_counter()
             executed, info = env.step_chunk(real_chunk, speed_params, exec_backend)
             done, success, _r, _mask = env.get_info_for_step()
+            env_step_wall = time.perf_counter() - stage_start
+            env_rpc_wall += env_step_wall
             ep_success = ep_success or bool(success)
-            t_acc += float(info.get("duration", 0.0))
+            ep_speed_violation |= bool(info.get("fixed_time_speed_violation", False))
+            dense_steps = int(info.get("n_exec_steps", 0))
+            t_acc += dense_steps / 250.0
+            planned_time += float(info.get("duration", 0.0))
 
             lc, rc = bool(info.get("left_contact", False)), bool(info.get("right_contact", False))
-            aggr_mean = float(np.mean(v_list)) if len(v_list) else 0.0
+            aggr_mean = float(np.mean(aggr_values)) if aggr_values else 0.0
             rec = dict(
                 step=step_i, t_sim=round(t_acc, 4),
-                dense_steps=int(info.get("n_exec_steps", 0)),
-                aggr_mean=aggr_mean, aggr=[float(x) for x in v_list],
+                dense_steps=dense_steps,
+                aggr_mean=aggr_mean, aggr=[float(x) for x in aggr_values],
+                reward_values=[float(x) for x in reward_values],
                 left_gripper=float(info.get("left_gripper", 0.0)),
                 right_gripper=float(info.get("right_gripper", 0.0)),
                 left_contact=lc, right_contact=rc,
                 exec_status=info.get("exec_status", "success"), success=bool(success),
+                execution_steps=int(info.get("execution_steps", 0)),
+                planned_cruise_fraction=float(info.get("planned_cruise_fraction", 0.0)),
+                fixed_time_speed_violation=bool(info.get("fixed_time_speed_violation", False)),
+                max_planned_qvel=float(info.get("max_planned_qvel", 0.0)),
+                vla_wall_s=vla_step_wall, dqn_wall_s=dqn_step_wall,
+                env_rpc_wall_s=env_step_wall,
             )
             rec.update({k: float(v) for k, v in speed_params.items()})  # v / vel_limit / acc_limit
+            if "acc_limit" in info and "acc_limit" not in rec:
+                rec["derived_acc_limit"] = float(info["acc_limit"])
             recs.append(rec)
             (all_contact_aggr if (lc or rc) else all_free_aggr).append(aggr_mean)
 
             if done:
                 break
+            stage_start = time.perf_counter()
             obs = env.get_observation()
+            obs_step_wall = time.perf_counter() - stage_start
+            obs_rpc_wall += obs_step_wall
+            rec["observation_rpc_wall_s"] = obs_step_wall
+
+        end_to_end_wall = time.perf_counter() - episode_wall_start
+        ep_reward_success = episode_reward_success(
+            exec_backend, ep_success, ep_speed_violation
+        )
 
         if record_video:
             env.stop_video()
@@ -289,11 +346,27 @@ def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
             except Exception as _e:
                 logging.warning("[%s] episode%d video rename 失败(忽略): %s", exec_backend, ep, _e)
         n_succ += int(ep_success)
+        n_reward_succ += int(ep_reward_success)
         _save_and_plot(out_dir, ep, recs, ep_success)
         ep_dense = int(sum(int(r["dense_steps"]) for r in recs))
+        fallback_count = sum(r["exec_status"] == "topp_fallback" for r in recs)
+        cruise_fraction = (
+            float(sum(r["planned_cruise_fraction"] * r["dense_steps"] for r in recs) / ep_dense)
+            if ep_dense > 0 and exec_backend == "chunk_toppra" else 0.0
+        )
         episodes.append(dict(
-            ep=ep, success=bool(ep_success), n_decision_steps=len(recs),
-            total_dense_steps=ep_dense, sim_time_s=round(t_acc, 4), recs=recs,
+            ep=ep, seed=int(seed + ep), success=bool(ep_success),
+            task_success=bool(ep_success), reward_success=bool(ep_reward_success),
+            fixed_time_speed_violation=bool(ep_speed_violation),
+            n_decision_steps=len(recs), k_skip=k_skip,
+            acc_rule=(WHOLE_CHUNK_ACC_RULE if exec_backend == "chunk_toppra" else None),
+            fallback_count=int(fallback_count),
+            planned_cruise_fraction=cruise_fraction,
+            total_dense_steps=ep_dense, sim_time_s=round(ep_dense / 250.0, 4),
+            planned_duration_s=planned_time,
+            vla_wall_s=vla_wall, dqn_wall_s=dqn_wall,
+            env_rpc_wall_s=env_rpc_wall, observation_rpc_wall_s=obs_rpc_wall,
+            end_to_end_wall_s=end_to_end_wall, recs=recs,
         ))
         logging.info("[%s] episode %d: success=%s decision_steps=%d dense_steps=%d sim_time=%.2fs",
                      exec_backend, ep, ep_success, len(recs), ep_dense, t_acc)
@@ -302,11 +375,37 @@ def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
     c_mean = float(np.mean(all_contact_aggr)) if all_contact_aggr else float("nan")
     f_mean = float(np.mean(all_free_aggr)) if all_free_aggr else float("nan")
     succ_eps = [e for e in episodes if e["success"]]
+    action_counts = {}
+    for var in backend.vars:
+        counts = {}
+        for episode in episodes:
+            for rec in episode["recs"]:
+                value = str(rec[var.name])
+                counts[value] = counts.get(value, 0) + 1
+        action_counts[var.name] = counts
     result = dict(
         exec_backend=exec_backend, n_episodes=n_episodes, success=n_succ,
+        reward_success=n_reward_succ,
         success_rate=n_succ / max(n_episodes, 1),
+        reward_success_rate=n_reward_succ / max(n_episodes, 1),
+        fixed_time_speed_violation_rate=(
+            float(np.mean([e["fixed_time_speed_violation"] for e in episodes]))
+            if episodes else 0.0
+        ),
+        fallback_rate=(
+            float(np.mean([e["fallback_count"] > 0 for e in episodes])) if episodes else 0.0
+        ),
+        k_skip=k_skip,
+        acc_rule=(WHOLE_CHUNK_ACC_RULE if exec_backend == "chunk_toppra" else None),
+        speed_action_counts=action_counts,
         mean_dense_steps=float(np.mean([e["total_dense_steps"] for e in episodes])) if episodes else 0.0,
         mean_sim_time_s=float(np.mean([e["sim_time_s"] for e in episodes])) if episodes else 0.0,
+        mean_end_to_end_wall_s=(float(np.mean([e["end_to_end_wall_s"] for e in episodes]))
+                               if episodes else 0.0),
+        mean_vla_wall_s=(float(np.mean([e["vla_wall_s"] for e in episodes])) if episodes else 0.0),
+        mean_dqn_wall_s=(float(np.mean([e["dqn_wall_s"] for e in episodes])) if episodes else 0.0),
+        mean_env_rpc_wall_s=(float(np.mean([e["env_rpc_wall_s"] for e in episodes]))
+                             if episodes else 0.0),
         # 只在成功 episode 上算执行步数（加速对比应在「都成功」的前提下比，避免失败早停拉低步数）
         mean_dense_steps_success=(float(np.mean([e["total_dense_steps"] for e in succ_eps]))
                                   if succ_eps else float("nan")),
@@ -341,7 +440,7 @@ def main(_):
             "example_action": example_action, "env_usage": "eval",
             "video_dir": os.path.join(out_dir, "videos"),
             "exec_backend": exec_backend,
-            "k_skip": config.get("k_skip", None),
+            "k_skip": backend_k_skip(config, exec_backend),
             "stream_hold_steps": int(config.get("stream_hold_steps", 15)),
             "eval_video_save_freq": 25,
             "force_limit": parse_force_limit(config.get("force_limit", "")),
@@ -359,15 +458,26 @@ def main(_):
         env, vla, dqnpack["backend"], dqnpack["learner"], exec_backend,
         n_episodes=FLAGS.n_episodes, max_decision_steps=FLAGS.max_decision_steps,
         seed=FLAGS.seed, out_dir=out_dir, record_video=FLAGS.record_video,
+        k_skip=backend_k_skip(config, exec_backend),
     )
 
     # ---- 汇总写盘（保持原 eval_summary.json 字段，新增加速指标 mean_dense_steps）----
     summary = {
         "n_episodes": result["n_episodes"], "success": result["success"],
         "success_rate": result["success_rate"],
+        "reward_success": result["reward_success"],
+        "reward_success_rate": result["reward_success_rate"],
         "mean_dense_steps": result["mean_dense_steps"],
         "mean_dense_steps_success": result["mean_dense_steps_success"],
         "mean_sim_time_s": result["mean_sim_time_s"],
+        "mean_end_to_end_wall_s": result["mean_end_to_end_wall_s"],
+        "mean_vla_wall_s": result["mean_vla_wall_s"],
+        "mean_dqn_wall_s": result["mean_dqn_wall_s"],
+        "mean_env_rpc_wall_s": result["mean_env_rpc_wall_s"],
+        "fixed_time_speed_violation_rate": result["fixed_time_speed_violation_rate"],
+        "fallback_rate": result["fallback_rate"],
+        "k_skip": result["k_skip"], "acc_rule": result["acc_rule"],
+        "speed_action_counts": result["speed_action_counts"],
         "aggr_in_contact_mean": result["aggr_in_contact_mean"],
         "aggr_free_mean": result["aggr_free_mean"],
         "decel_near_contact": result["decel_near_contact"],

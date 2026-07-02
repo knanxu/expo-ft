@@ -6,19 +6,18 @@ argmax 选一档；总 bin 数 = Σ Nᵢ（相加）而非 Π Nᵢ（相乘）�
 
   - 方式1 ``fixed_time``        : 1 变量 v —— RoboTwin streaming（论文式固定时长，reconstruct(v)）。
   - 方式2 ``per_action_toppra`` : 3 变量 —— v + vel_limit + acc_limit（RoboTwin per_action，逐 action TOPP）。
-  - 方式3 ``chunk_toppra``      : 3 变量 —— v + vel_limit + acc_limit（RoboTwin whole_chunk，整段 TOPPRA）。
+  - 方式3 ``chunk_toppra``      : 1 变量 vel_limit（acc_limit=4*vel_limit² 由执行层派生）。
 
-动作空间值绝对值制（v=chunk 压缩比∈[1,4]；vel_limit/acc_limit=绝对关节速度/加速度上限 rad/s·rad/s²，
-≤真机、执行层钳 PHYS_CEIL）。decode 出的 speed_params 直接传 take_chunk_action_per_action；reward 里的
-vᵢ 是各档位归一化激进度∈[0,1]（与真实值解耦），保证 success-gated reward 防 hacking。
+动作空间值绝对值制（v=chunk 压缩比∈[1,4]；vel_limit/acc_limit=绝对关节速度/加速度上限
+rad/s、rad/s²）。whole-chunk 不再独立输出 acc_limit，而是在执行层直接取 ``4*vel_limit**2``，
+且不施加额外加速度物理上限。
 
 reward（防 reward hacking，success-gated）：
 
-    r = r_task + 1[success] · Σᵢ αᵢ · vᵢ^βᵢ
+    r = 1[success] · α · speed^β
 
-``r_task`` 是稀疏 0/1 终局；``vᵢ ∈ [0,1]`` 是第 i 个变量「越快越大」的归一化激进度
-（由 DQN 选中的档位决定）。失败 episode（success=0）速度项整体归零 —— 任何「盲目加速
-但任务失败」都拿不到额外奖励，唯一拿更大奖励的路径是「成功 *且* 更快」。
+fixed-time 与 whole-chunk 使用原始 ``speed∈[1,4]``、默认 α=1、β=2，任务失败奖励为 0，
+不额外叠加任务奖励。per-action 作为兼容路径仍使用归一化激进度及稀疏任务项。
 
 这是纯 numpy（rollout/CPU 端用），learner 端的 DQN 用 jax；二者通过 ``head_sizes`` /
 ``decode`` / ``total_reward`` 解耦。
@@ -48,10 +47,12 @@ class SpeedVar:
     faster_is: str = "larger"
     alpha: float = 1.0
     beta: float = 1.0
+    reward_input: str = "normalized"
 
     def __post_init__(self):
         assert len(self.grid) >= 1, f"SpeedVar {self.name} grid 不能为空"
         assert self.faster_is in ("smaller", "larger"), self.faster_is
+        assert self.reward_input in ("normalized", "raw"), self.reward_input
         assert self.alpha >= 0.0 and self.beta > 0.0
 
     @property
@@ -71,6 +72,10 @@ class SpeedVar:
         norm = (float(self.grid[idx]) - lo) / (hi - lo)  # ∈[0,1]
         return (1.0 - norm) if self.faster_is == "smaller" else norm
 
+    def reward_value(self, idx: int) -> float:
+        """用于 reward 的值：论文式 raw speed 或兼容 per-action 的归一化激进度。"""
+        return self.value(idx) if self.reward_input == "raw" else self.aggressiveness(idx)
+
 
 @dataclasses.dataclass(frozen=True)
 class ExecBackend:
@@ -78,6 +83,7 @@ class ExecBackend:
 
     name: str
     vars: Tuple[SpeedVar, ...]
+    include_task_reward: bool = True
 
     def __post_init__(self):
         assert len(self.vars) >= 1, f"exec_backend {self.name} 至少 1 个变量"
@@ -94,14 +100,14 @@ class ExecBackend:
         return tuple(v.n_bins for v in self.vars)
 
     def decode(self, action_idxs: Sequence[int]) -> Tuple[Dict[str, float], List[float]]:
-        """DQN 每 head 的档位索引 → (speed_params 下发给 env, 各变量归一化激进度 v_list)。
+        """DQN 每 head 的档位索引 → (speed_params, reward_values)。
 
         Args:
           action_idxs: 长度 = n_heads 的离散档位索引（每 head 一个）。
 
         Returns:
           speed_params: {var_name: 真实参数值}，传给 ``env.step_chunk(..., speed_params=...)``。
-          v_list:       [v₁, v₂, ...]，每变量 ∈[0,1] 的激进度，传给 ``total_reward``。
+          v_list:       fixed/chunk 为原始 1–4，per-action 为归一化激进度。
         """
         assert len(action_idxs) == self.n_heads, (len(action_idxs), self.n_heads)
         speed_params: Dict[str, float] = {}
@@ -110,7 +116,7 @@ class ExecBackend:
             idx = int(idx)
             assert 0 <= idx < var.n_bins, f"{var.name} idx {idx} 越界 [0,{var.n_bins})"
             speed_params[var.name] = var.value(idx)
-            v_list.append(var.aggressiveness(idx))
+            v_list.append(var.reward_value(idx))
         return speed_params, v_list
 
     def speed_reward(self, success: bool, v_list: Sequence[float]) -> float:
@@ -125,8 +131,9 @@ class ExecBackend:
         return float(total)
 
     def total_reward(self, r_task: float, success: bool, v_list: Sequence[float]) -> float:
-        """完整 reward：r_task + 1[success]·Σ αᵢ vᵢ^βᵢ（防 hacking 的核心入口）。"""
-        return float(r_task) + self.speed_reward(success, v_list)
+        """完整 reward；fixed/chunk 仅用 success-gated raw-speed，per-action 保留任务项。"""
+        task = float(r_task) if self.include_task_reward else 0.0
+        return task + self.speed_reward(success, v_list)
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +142,7 @@ class ExecBackend:
 
 # RoboTwin 真实速度参数（绝对值制：vel_limit/acc_limit 直接是关节上限，对接 take_chunk_action_per_action）。
 # v = chunk 压缩比 ∈[1,4]（reconstruct_chunk: 1=原速，越大帧数越少=越快）。faster_is="larger"。
+_DEFAULT_SPEED = (1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0)
 _DEFAULT_V = (1.0, 1.5, 2.0, 3.0, 4.0)
 # vel_limit = 绝对关节速度上限 (rad/s, ≤真机 5~5.5)；acc_limit = 绝对加速度上限 (rad/s²)。越大越快。
 # 占位值：Task 6 (calibrate_acc_grid) 标定后回填 acc_limit；vel_limit 按真机速度定。
@@ -145,13 +153,14 @@ _DEFAULT_ACC_LIMIT = (1.0, 3.0, 5.0, 7.0, 9.0)
 def _default_specs() -> Dict[str, dict]:
     """每个 exec_backend 的默认变量规格（grid/faster_is/alpha/beta），供 config 浅覆盖。
 
-    grid 用 RoboTwin 真实参数值（decode 后直接传 take_chunk_action_backend）；reward 里的 vᵢ
-    是各档位归一化激进度∈[0,1]（与真实值解耦），保证 success-gated reward 防 hacking。
+    grid 用 RoboTwin 真实参数值（decode 后直接传执行后端）。fixed/chunk reward 使用原始
+    1–4 数值；per-action 保留归一化激进度。
     """
     return {
         # 方式1 fixed_time（RoboTwin streaming）：只调标量 v（论文式固定时长）。
         "fixed_time": {
-            "v": dict(grid=_DEFAULT_V, faster_is="larger", alpha=1.0, beta=1.0),
+            "v": dict(grid=_DEFAULT_SPEED, faster_is="larger", alpha=1.0, beta=2.0,
+                      reward_input="raw"),
         },
         # 方式2 per_action_toppra（RoboTwin per_action，逐 action TOPP）：v + vel_limit + acc_limit。
         "per_action_toppra": {
@@ -159,11 +168,10 @@ def _default_specs() -> Dict[str, dict]:
             "vel_limit": dict(grid=_DEFAULT_VEL_LIMIT, faster_is="larger", alpha=0.5, beta=1.0),
             "acc_limit": dict(grid=_DEFAULT_ACC_LIMIT, faster_is="larger", alpha=0.5, beta=1.0),
         },
-        # 方式3 chunk_toppra（RoboTwin whole_chunk，整段 TOPPRA）：v + vel_limit + acc_limit。
+        # 方式3 chunk_toppra：网络只选 vel_limit；acc_limit=4*vel_limit² 由执行层派生。
         "chunk_toppra": {
-            "v": dict(grid=_DEFAULT_V, faster_is="larger", alpha=0.5, beta=1.0),
-            "vel_limit": dict(grid=_DEFAULT_VEL_LIMIT, faster_is="larger", alpha=0.5, beta=1.0),
-            "acc_limit": dict(grid=_DEFAULT_ACC_LIMIT, faster_is="larger", alpha=0.5, beta=1.0),
+            "vel_limit": dict(grid=_DEFAULT_SPEED, faster_is="larger", alpha=1.0, beta=2.0,
+                              reward_input="raw"),
         },
     }
 
@@ -194,7 +202,11 @@ def build_backend(name: str, overrides: Dict[str, dict] = None) -> ExecBackend:
         merged.update(overrides.get(var_name, {}))
         merged["grid"] = tuple(float(x) for x in merged["grid"])
         out_vars.append(SpeedVar(name=var_name, **merged))
-    return ExecBackend(name=name, vars=tuple(out_vars))
+    return ExecBackend(
+        name=name,
+        vars=tuple(out_vars),
+        include_task_reward=name == "per_action_toppra",
+    )
 
 
 def parse_force_limit(spec) -> Optional[List[float]]:

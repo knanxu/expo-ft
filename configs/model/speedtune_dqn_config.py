@@ -14,7 +14,6 @@ VLA 字段复用 expo_ft_pi_drift_config 的 pi0.5 加载约定；但 VLA **全�
 import os
 
 import ml_collections
-from ml_collections.config_dict import config_dict
 
 
 def get_config():
@@ -37,12 +36,13 @@ def get_config():
     config.force_limit = os.environ.get("SPEEDTUNE_FORCE_LIMIT", "30,40,30,15,10,10")
 
     # --- 执行方式（三选一，对应 exec_backends；决定 DQN head 数与动作空间）---
-    # "fixed_time"(1 head) / "per_action_toppra"(3 head) / "chunk_toppra"(3 head)
+    # "fixed_time"(1 head) / "per_action_toppra"(3 head) / "chunk_toppra"(1 head)
     config.exec_backend = "per_action_toppra"
-    # 论文式 frame skip：每决策只执行 reconstruct(v) 后前 k_skip 个 action 即重推 VLA（闭环），
-    # 缩短 MDP horizon。三种执行方式均生效：streaming/per_action 逐帧；whole_chunk（整段 TOPPRA）
-    # 取前 k_skip 帧做一次整段 TOPPRA。None/0=整段执行。
-    config.k_skip = 10
+    # Backend-specific frame skip：fixed_time 必须满足 k_skip*v_max<=H；whole-chunk
+    # 不做 reconstruct(v)，使用更长窗口提高单次 TOPPRA 的有效路径长度。
+    config.k_skip = 10                    # per_action 兼容默认
+    config.fixed_time_k_skip = 10
+    config.chunk_toppra_k_skip = 20
     config.stream_hold_steps = 15        # fixed_time(streaming) 每目标 hold 物理步（250/15≈16.7Hz，对齐采集）
 
     # --- 动作时序：drift 双臂 chunk H=50；SpeedTune 决策粒度 = 一整段 chunk ---
@@ -50,9 +50,13 @@ def get_config():
     config.n_real_dims = 14              # 双臂真实维 2×(6关节+1夹爪)
 
     # --- branching Rainbow-DQN ---
-    config.n_atoms = 51                  # C51 原子数
-    config.v_min = -1.0                  # value support 下限（按 reward 量级；见下）
-    config.v_max = 11.0                  # 上限（留余量：reward≈r_task + Σαᵢvᵢ^βᵢ，n-step 折扣累积）
+    config.n_atoms = 100                 # C51 原子数
+    config.v_min = -1.0                  # per_action 兼容 support
+    config.v_max = 11.0
+    # r_max=4²=16, gamma=.99, step_lim=800：Qmin=0；fixed 最多80决策，
+    # Qmax=16*(1-.99^80)/(1-.99)=883.963；whole 最多40决策，Qmax=529.645。
+    config.fixed_time_support = (0.0, 900.0)
+    config.chunk_toppra_support = (0.0, 550.0)
     config.dueling = True
     config.q_hidden_dims = (256, 256)
     config.detach_q_input = True         # stop_gradient suffix_feat（VLA 冻结，再加一道保险）
@@ -85,8 +89,8 @@ def get_config():
 
     # --- reward 统一覆盖钮（None=用 exec_backends 各变量默认 α/β）---
     # 细调单个变量请改 exec_backends._default_specs；这里是一键统一缩放。
-    config.reward_alpha = config_dict.placeholder(float)
-    config.reward_beta = config_dict.placeholder(float)
+    config.reward_alpha = 1.0
+    config.reward_beta = 2.0
 
     # --- 杂项 ---
     config.max_iters = 40000             # training step = 一次 chunk 执行(决策步)，跑 40000 个

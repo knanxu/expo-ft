@@ -42,6 +42,31 @@ _config_task_path: Optional[str] = None
 _robotwin_root: Optional[str] = None
 
 
+def _build_step_chunk_response(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Serialize every SpeedTune execution/safety field across the websocket boundary."""
+    executed = np.array(result["executed_action"], dtype=np.float64)
+    response = {
+        "status": "success",
+        "action": executed.tolist(),
+        "n_exec_steps": int(result.get("n_exec_steps", 0)),
+        "duration": float(result.get("duration", 0.0)),
+        "exec_status": str(result.get("exec_status", "success")),
+        "left_gripper": float(result.get("left_gripper", 0.0)),
+        "right_gripper": float(result.get("right_gripper", 0.0)),
+        "left_contact": bool(result.get("left_contact", False)),
+        "right_contact": bool(result.get("right_contact", False)),
+        "execution_steps": int(result.get("execution_steps", 0)),
+        "planned_cruise_fraction": float(result.get("planned_cruise_fraction", 0.0)),
+        "fixed_time_speed_violation": bool(result.get("fixed_time_speed_violation", False)),
+        "max_planned_qvel": float(result.get("max_planned_qvel", 0.0)),
+        "action_type": "policy",
+    }
+    for key in ("vel_limit", "acc_limit"):
+        if key in result:
+            response[key] = float(result[key])
+    return response
+
+
 def load_task_config(config_path: Optional[str]):
     """Import configs.task.X.get_config()（同 run_client.load_task_config）。"""
     if config_path is None:
@@ -146,19 +171,7 @@ async def _handle_environment_request(websocket: _server.ServerConnection):
                             speed_params=request.get("speed_params") or {},
                             exec_backend=request.get("exec_backend"),
                         )
-                        executed = np.array(result["executed_action"], dtype=np.float64)
-                        response = {
-                            "status": "success",
-                            "action": executed.tolist(),
-                            "n_exec_steps": int(result.get("n_exec_steps", 0)),
-                            "duration": float(result.get("duration", 0.0)),
-                            "exec_status": str(result.get("exec_status", "success")),
-                            "left_gripper": float(result.get("left_gripper", 0.0)),
-                            "right_gripper": float(result.get("right_gripper", 0.0)),
-                            "left_contact": bool(result.get("left_contact", False)),
-                            "right_contact": bool(result.get("right_contact", False)),
-                            "action_type": "policy",
-                        }
+                        response = _build_step_chunk_response(result)
                     await websocket.send(packer.pack(response))
 
                 elif operation == "start_video":

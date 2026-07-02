@@ -10,8 +10,8 @@ RoboTwin 侧 API（精读 `/home/xukainan/RoboTwin/envs/_base_task.py` + `script
   - 任务 env = `envs.{task_name}` 模块里的同名类（继承 Base_Task），含 `play_once`/`check_success`。
   - `setup_demo(now_ep_num, seed, is_test=True, **task_config)`：按 seed 布置一个 episode 场景。
   - `get_obs()` → 嵌套 dict：`observation[cam]["rgb"]`（head/left/right_camera）+ `joint_action["vector"]`(14)。
-  - `take_action(action, action_type="qpos")`：**逐 action 执行（方式2，逐帧 TOPP，变帧数）**；
-    `take_chunk_action(chunk,...)` 是方式1（整段 TOPPRA），`_apply_k_skip` 是方式3（固定帧）。
+  - `take_action(action, action_type="qpos")`：逐 action 执行；`take_chunk_action(chunk,...)`
+    是整段 TOPPRA；`take_chunk_action_streaming` 是 fixed-time。
     本适配器按 env_client 的「每步一个 action」协议，**固定走方式2 的 `take_action`**。
   - `check_success()` → bool；`set_instruction`/`get_instruction`；`close_env()`；`exec_backend` 属性。
 
@@ -386,12 +386,12 @@ class RoboTwinEnv:
     def step_chunk(self, chunk, speed_params=None, exec_backend=None) -> Dict[str, Any]:
         """整段执行一个 action chunk + 速度控制参数（SpeedTune 决策粒度）。
 
-        直接对接 RoboTwin 已内置的三种执行后端：chunk 压缩由 RoboTwin 的 ``reconstruct_chunk(v)``
-        内部完成，本适配器**只透传** v/vel_limit/acc_limit（不再自行压缩）。
+        直接对接 RoboTwin 三种执行后端。fixed-time/per-action 保留 ``v`` 重构；whole-chunk
+        先截取 ``execution_steps``，仅透传 ``vel_limit``，加速度由执行层按 ``4V²`` 派生。
 
         Args:
           chunk:        ``[H, n_real_dims]`` 绝对 qpos 目标序列（原始，不压缩）。
-          speed_params: {"v": 压缩比∈[1,4], "vel_limit": 绝对 rad/s, "acc_limit": 绝对 rad/s²}（见 exec_backends）。
+          speed_params: backend 对应的离散参数；whole-chunk 仅含 ``vel_limit``。
           exec_backend: "fixed_time"/"per_action_toppra"/"chunk_toppra"；缺省用 self.exec_backend。
         Returns:
           {"executed_action": 最后一帧 qpos, "n_exec_steps": 实际仿真帧数(dense_steps),
@@ -418,22 +418,31 @@ class RoboTwinEnv:
             info = self._call_backend(self.env.take_chunk_action_per_action, chunk,
                                       vel_limit=vel_limit, acc_limit=acc_limit, v=v,
                                       max_actions=self._k_skip, video_save_freq=vsf)
-        else:  # whole_chunk：整段 TOPPRA；k_skip 取前 k 帧再整段重参数化（_call_backend 按签名过滤，向后兼容）
+        else:  # whole_chunk：先取 execution_steps 帧，再 spline/TOPPRA；acc=4*vel² 在执行层派生
             info = self._call_backend(self.env.take_chunk_action, chunk,
-                                      vel_limit=vel_limit, acc_limit=acc_limit, v=v,
-                                      max_actions=self._k_skip, video_save_freq=vsf)
+                                      vel_limit=vel_limit, execution_steps=self._k_skip,
+                                      video_save_freq=vsf)
         info = info or {}
         # episode 预算按消耗的 action 数累加（与 RoboTwin step_lim 同语义；后端内部也自查 step_lim）。
         self._steps_since_reset += int(info.get("take_action_cnt_delta", 0) or 0)
         lg, rg, lc, rc = self._contact_info()
-        return {
+        result = {
             "executed_action": chunk[-1],
             "n_exec_steps": int(info.get("dense_steps", 0) or 0),
             "duration": float(info.get("duration", 0.0) or 0.0),
             "exec_status": str(info.get("status", "success")),
             "left_gripper": lg, "right_gripper": rg,      # ∈[0,1] 0=闭合/抓取
             "left_contact": lc, "right_contact": rc,      # sapien 物理接触（夹爪↔物体）
+            "execution_steps": int(info.get("execution_steps", info.get("take_action_cnt_delta", 0)) or 0),
+            "planned_cruise_fraction": float(info.get("planned_cruise_fraction", 0.0) or 0.0),
+            "fixed_time_speed_violation": bool(info.get("fixed_time_speed_violation", False)),
+            "max_planned_qvel": float(info.get("max_planned_qvel", 0.0) or 0.0),
         }
+        if "vel_limit" in info:
+            result["vel_limit"] = float(info["vel_limit"])
+        if "acc_limit" in info:
+            result["acc_limit"] = float(info["acc_limit"])
+        return result
 
     # ---- eval 用：接触信号 + 视频录制（train 路径不触发）-------------------
     # 物体判定：entity 名不含这些机器人/场景关键词即视为可抓物体。

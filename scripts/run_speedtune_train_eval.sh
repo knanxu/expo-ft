@@ -1,220 +1,261 @@
 #!/usr/bin/env bash
-# SpeedTune 一体化：4 卡并行训练 per_action_toppra + fixed_time，训练完成后自动 eval 对比。
-# 替代「run_speedtune_2backends.sh 训练 → 手填 CKPT → run_eval_compare.sh」两步手动衔接。
-#
-# 卡分配（4 卡；server 与 train 分卡避免光追 sapien 与 3B VLA 抢显存）：
-#   per_action_toppra: server→GPU0:8102 | train→GPU1
-#   fixed_time:        server→GPU2:8103 | train→GPU3
-#   eval compare:      复用上面两个 server，compare→GPU1（train 退出后空出）
-#
-# 训练跑满 MAX_ITERS 自然退出 → final checkpoint 落盘（train finally: _stop+join 保证）→
-# 自动找最新 update_N → 复用训练 server 跑 eval_speedtune_compare（不重起 server/不端口预检）。
-#
-# 用法（云端）：
-#   export SPEEDTUNE_VLA_CKPT=/abs/path/.../params        # 必填
-#   export SPEEDTUNE_VLA_ASSETS=/abs/path/.../assets      # 选填(norm_stats)
-#   export SPEEDTUNE_VLA_ASSET_ID=trossen                 # 选填
-#   bash scripts/run_speedtune_train_eval.sh
-#   冒烟：MAX_ITERS=2000 N_EPISODES=3 bash scripts/run_speedtune_train_eval.sh
-#   指定 backend（≤2，含 chunk_toppra）：BACKENDS="per_action_toppra chunk_toppra" bash scripts/run_speedtune_train_eval.sh
-#   未传 BACKENDS：交互终端会询问；nohup 后台用默认 per_action_toppra chunk_toppra。
-#
-# 跑前清残留（光追退出不彻底会占显存 → cannot create buffer）：
-#   pkill -9 -f run_robotwin_client; pkill -9 -f train_speedtune_async; pkill -9 -f eval_speedtune; sleep 3; nvidia-smi
-# 停止：Ctrl-C（trap 清理）。
+# Train one or two backend-specific SpeedTune DQNs, then evaluate them.
+# Default comparison: fixed_time vs chunk_toppra.
 
 set -euo pipefail
 
-# ===== 配置（环境变量可覆盖）=====
-EXPO_ROOT="${EXPO_ROOT:-/home/chenlu/expo-ft}"
-ROBOTWIN_ROOT="${ROBOTWIN_ROOT:-/home/chenlu/RoboTwin}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_EXPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+EXPO_ROOT="${EXPO_ROOT:-$DEFAULT_EXPO_ROOT}"
+ROBOTWIN_ROOT="${ROBOTWIN_ROOT:-$(dirname "$EXPO_ROOT")/RoboTwin}"
 ROBOTWIN_ENV="${ROBOTWIN_ENV:-RoboTwin}"
 PYTHON="${PYTHON:-uv run python}"
 TASK_CONFIG="${TASK_CONFIG:-configs/task/robotwin_stack_blocks.py}"
 MODEL_CONFIG="${MODEL_CONFIG:-configs/model/speedtune_dqn_config.py}"
 WANDB_PROJECT="${WANDB_PROJECT:-expo-ft-speedtune}"
-MAX_ITERS="${MAX_ITERS:-40000}"          # training step = 一次 chunk 执行(决策步)
+MAX_ITERS="${MAX_ITERS:-40000}"
 SEED="${SEED:-42}"
-SERVER_WAIT="${SERVER_WAIT:-45}"
+SERVER_WAIT="${SERVER_WAIT:-90}"
 TRAIN_MEM_FRAC="${TRAIN_MEM_FRAC:-0.85}"
 COMPARE_MEM_FRAC="${COMPARE_MEM_FRAC:-0.85}"
 STREAM_HOLD_STEPS="${STREAM_HOLD_STEPS:-15}"
-N_EPISODES="${N_EPISODES:-5}"
+N_EPISODES="${N_EPISODES:-30}"
 MAX_DECISION_STEPS="${MAX_DECISION_STEPS:-400}"
+DRY_RUN="${DRY_RUN:-0}"
+CLEANUP_SELF_TEST="${CLEANUP_SELF_TEST:-0}"
+COMPARE_GPU="${COMPARE_GPU:-1}"
 
-# 执行层力矩底座（per-joint 单臂 τ_max, N·m；空串=不施加）。train+compare 进程都继承。
 export SPEEDTUNE_FORCE_LIMIT="${SPEEDTUNE_FORCE_LIMIT:-30,40,30,15,10,10}"
-
-: "${SPEEDTUNE_VLA_CKPT:?请先 export SPEEDTUNE_VLA_CKPT=<微调后 drift pi0.5 ckpt 绝对路径>}"
+: "${SPEEDTUNE_VLA_CKPT:?export SPEEDTUNE_VLA_CKPT=<frozen pi0.5 checkpoint>}"
 export SPEEDTUNE_VLA_CKPT
 export SPEEDTUNE_VLA_ASSETS="${SPEEDTUNE_VLA_ASSETS:-}"
 export SPEEDTUNE_VLA_ASSET_ID="${SPEEDTUNE_VLA_ASSET_ID:-}"
 
-# 资源池（server 与 train 分卡避免光追 sapien 与 3B VLA 抢显存；与 eval 默认 port 对齐 8102/8103）。
 ALL_BACKENDS=(fixed_time per_action_toppra chunk_toppra)
 PORTS=(8102 8103)
 SERVER_GPUS=(0 2)
 TRAIN_GPUS=(1 3)
-COMPARE_GPU="${COMPARE_GPU:-1}"
 
-# 外露 BACKENDS：训练前传 BACKENDS="A B"（≤2 个，云端只支持 2 个并行）。
-#   已设          → 用之；
-#   未设 + 交互终端 → 列出三选项询问；
-#   未设 + 非交互   → 默认 per_action_toppra chunk_toppra（并打印提示，nohup 后台不卡）。
 if [ -n "${BACKENDS:-}" ]; then
   read -ra BACKENDS <<< "$BACKENDS"
-elif [ -t 0 ]; then
-  echo "可选执行后端：${ALL_BACKENDS[*]}（云端只支持同时训练 2 个）"
-  read -r -p "请输入要训练的 backend（空格分隔，最多 2 个，回车用默认 per_action_toppra chunk_toppra）：" _line
-  if [ -n "$_line" ]; then read -ra BACKENDS <<< "$_line"; else BACKENDS=(per_action_toppra chunk_toppra); fi
+elif [ -t 0 ] && [ "$DRY_RUN" != "1" ]; then
+  echo "Backends: ${ALL_BACKENDS[*]} (choose one or two)"
+  read -r -p "BACKENDS [fixed_time chunk_toppra]: " line
+  if [ -n "$line" ]; then read -ra BACKENDS <<< "$line"; else BACKENDS=(fixed_time chunk_toppra); fi
 else
-  BACKENDS=(per_action_toppra chunk_toppra)
-  echo "[*] 未设 BACKENDS 且非交互终端 → 默认: ${BACKENDS[*]}"
+  BACKENDS=(fixed_time chunk_toppra)
 fi
 
-# 校验数量与合法性
 if [ "${#BACKENDS[@]}" -lt 1 ] || [ "${#BACKENDS[@]}" -gt 2 ]; then
-  echo "[ERROR] BACKENDS 必须是 1~2 个（云端只支持 2 个并行），当前(${#BACKENDS[@]}): ${BACKENDS[*]}" >&2
-  exit 1
+  echo "[ERROR] BACKENDS must contain one or two entries: ${BACKENDS[*]}" >&2
+  exit 2
 fi
 for be in "${BACKENDS[@]}"; do
   case "$be" in
     fixed_time|per_action_toppra|chunk_toppra) ;;
-    *) echo "[ERROR] 未知 backend: '$be'（合法: ${ALL_BACKENDS[*]}）" >&2; exit 1 ;;
+    *) echo "[ERROR] invalid backend '$be'" >&2; exit 2 ;;
   esac
 done
 
-# 按 backend 数切片资源池
 PORTS=("${PORTS[@]:0:${#BACKENDS[@]}}")
 SERVER_GPUS=("${SERVER_GPUS[@]:0:${#BACKENDS[@]}}")
 TRAIN_GPUS=("${TRAIN_GPUS[@]:0:${#BACKENDS[@]}}")
-echo "[*] 训练 backend: ${BACKENDS[*]} | ports: ${PORTS[*]} | server_gpus: ${SERVER_GPUS[*]} | train_gpus: ${TRAIN_GPUS[*]}"
+read -ra PYTHON_CMD <<< "$PYTHON"
 
-STAMP="$(date +%m%d_%H%M)"
-LOGDIR="${EXPO_ROOT}/logs/speedtune_traineval_${STAMP}"
-OUTPUT_DIR="${LOGDIR}/compare_eval"
-mkdir -p "$LOGDIR" "$OUTPUT_DIR"
-echo "[*] 日志目录: $LOGDIR"
-echo "[*] 冻结 VLA ckpt: $SPEEDTUNE_VLA_CKPT"
-echo "[*] force_limit(τ_max): ${SPEEDTUNE_FORCE_LIMIT:-<空=不施加>}"
-
-SERVER_PIDS=()
-TRAIN_PIDS=()
-cleanup() {
-  echo ""
-  echo "[cleanup] 终止所有子进程 ..."
-  for p in "${TRAIN_PIDS[@]:-}" "${SERVER_PIDS[@]:-}"; do kill -9 "$p" 2>/dev/null || true; done
-  wait 2>/dev/null || true
+require_path() {
+  local path="$1" label="$2"
+  [ -e "$path" ] || { echo "[ERROR] missing $label: $path" >&2; exit 2; }
 }
-trap cleanup EXIT INT TERM
 
+require_path "$EXPO_ROOT" EXPO_ROOT
+require_path "$ROBOTWIN_ROOT" ROBOTWIN_ROOT
+require_path "$SPEEDTUNE_VLA_CKPT" SPEEDTUNE_VLA_CKPT
+require_path "$EXPO_ROOT/$TASK_CONFIG" TASK_CONFIG
+require_path "$EXPO_ROOT/$MODEL_CONFIG" MODEL_CONFIG
+if [ -n "$SPEEDTUNE_VLA_ASSETS" ]; then require_path "$SPEEDTUNE_VLA_ASSETS" SPEEDTUNE_VLA_ASSETS; fi
+command -v "${PYTHON_CMD[0]}" >/dev/null || { echo "[ERROR] missing command: ${PYTHON_CMD[0]}" >&2; exit 2; }
+command -v conda >/dev/null || { echo "[ERROR] missing conda" >&2; exit 2; }
+command -v setsid >/dev/null || { echo "[ERROR] missing setsid" >&2; exit 2; }
+
+port_is_free() {
+  python - "$1" <<'PY'
+import socket, sys
+s = socket.socket()
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+finally:
+    s.close()
+PY
+}
+
+port_is_listening() {
+  python - "$1" <<'PY'
+import socket, sys
+s = socket.socket(); s.settimeout(.5)
+try:
+    ok = s.connect_ex(("127.0.0.1", int(sys.argv[1]))) == 0
+finally:
+    s.close()
+raise SystemExit(0 if ok else 1)
+PY
+}
+
+if [ "$DRY_RUN" != "1" ] && [ "$CLEANUP_SELF_TEST" != "1" ]; then
+  command -v nvidia-smi >/dev/null || { echo "[ERROR] nvidia-smi not found" >&2; exit 2; }
+  gpu_count="$(nvidia-smi -L | wc -l)"
+  [ "$gpu_count" -ge 4 ] || { echo "[ERROR] four GPUs required, found $gpu_count" >&2; exit 2; }
+  conda env list | awk '{print $1}' | grep -Fxq "$ROBOTWIN_ENV" || {
+    echo "[ERROR] conda env '$ROBOTWIN_ENV' not found" >&2; exit 2;
+  }
+  for port in "${PORTS[@]}"; do
+    port_is_free "$port" || { echo "[ERROR] port $port is already in use" >&2; exit 2; }
+  done
+fi
+
+STAMP="$(date +%m%d_%H%M%S)"
+LOGDIR="${LOGDIR:-$EXPO_ROOT/logs/speedtune_traineval_$STAMP}"
+OUTPUT_DIR="$LOGDIR/compare_eval"
+
+if [ "$DRY_RUN" = "1" ]; then
+  echo "[DRY-RUN] backends: ${BACKENDS[*]}"
+  echo "[DRY-RUN] n_episodes: $N_EPISODES"
+  for i in "${!BACKENDS[@]}"; do
+    echo "[DRY-RUN] server backend=${BACKENDS[$i]} gpu=${SERVER_GPUS[$i]} port=${PORTS[$i]}"
+    echo "[DRY-RUN] train backend=${BACKENDS[$i]} gpu=${TRAIN_GPUS[$i]} config.exec_backend=${BACKENDS[$i]}"
+  done
+  if [ "${#BACKENDS[@]}" -eq 2 ]; then
+    echo "[DRY-RUN] eval backend_a=${BACKENDS[0]} port_a=${PORTS[0]} backend_b=${BACKENDS[1]} port_b=${PORTS[1]}"
+  else
+    echo "[DRY-RUN] eval backend=${BACKENDS[0]} port=${PORTS[0]}"
+  fi
+  exit 0
+fi
+
+mkdir -p "$LOGDIR" "$OUTPUT_DIR"
 cd "$EXPO_ROOT"
 
-# ---- 1) 起 2 个 server（每个独占一卡，光追渲染）----
-for i in "${!BACKENDS[@]}"; do
-  be="${BACKENDS[$i]}"; port="${PORTS[$i]}"; sgpu="${SERVER_GPUS[$i]}"
-  echo "[$be] 启动 env server  server_GPU=$sgpu  port=$port"
-  CUDA_VISIBLE_DEVICES="$sgpu" \
-  conda run --no-capture-output -n "$ROBOTWIN_ENV" \
-    python -m client_robotwin.run_robotwin_client \
-      --config_task_path "$TASK_CONFIG" --robotwin_root "$ROBOTWIN_ROOT" --server_port "$port" \
-      > "$LOGDIR/server_${be}.log" 2>&1 &
-  SERVER_PIDS+=($!)
-done
+declare -a ALL_PIDS=()
+declare -a ALL_LABELS=()
+declare -a ALL_LOGS=()
+STAGE="startup"
 
-echo "[*] 等 server 渲染自检/就绪 (${SERVER_WAIT}s) ..."
-sleep "$SERVER_WAIT"
-for be in "${BACKENDS[@]}"; do
-  if grep -q "address already in use" "$LOGDIR/server_${be}.log" 2>/dev/null; then
-    echo "[ERROR] $be server 端口 bind 失败（address already in use）。先清理残留后重跑。" >&2
-    exit 1
+cleanup() {
+  local rc="$?" pid
+  trap - EXIT INT TERM
+  echo "[cleanup] stage=$STAGE rc=$rc logdir=$LOGDIR"
+  for pid in "${ALL_PIDS[@]:-}"; do
+    if kill -0 "$pid" 2>/dev/null; then kill -TERM -- "-$pid" 2>/dev/null || true; fi
+  done
+  for _ in 1 2 3 4 5; do
+    local alive=0
+    for pid in "${ALL_PIDS[@]:-}"; do kill -0 "$pid" 2>/dev/null && alive=1; done
+    [ "$alive" -eq 0 ] && break
+    sleep 1
+  done
+  for pid in "${ALL_PIDS[@]:-}"; do
+    if kill -0 "$pid" 2>/dev/null; then kill -KILL -- "-$pid" 2>/dev/null || true; fi
+  done
+  wait 2>/dev/null || true
+  if [ "$rc" -ne 0 ]; then
+    echo "[ERROR] failed during $STAGE. Logs:"
+    for i in "${!ALL_LOGS[@]}"; do echo "  ${ALL_LABELS[$i]}: ${ALL_LOGS[$i]}"; done
   fi
-  if grep -q "Render Well" "$LOGDIR/server_${be}.log" 2>/dev/null; then
-    echo "[$be] server ✓ Render Well"
-  else
-    echo "[$be] server 渲染状态未知（可能还在初始化）；若 train 报 cannot create buffer 看 server_${be}.log"
-  fi
-done
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-# ---- 2) 起 2 个 train（每个独占一卡，与 server 分卡）；只 wait train 进程 ----
-for i in "${!BACKENDS[@]}"; do
-  be="${BACKENDS[$i]}"; port="${PORTS[$i]}"; tgpu="${TRAIN_GPUS[$i]}"
-  run_name="speedtune_${be}_${STAMP}"
-  echo "[$be] 启动训练  train_GPU=$tgpu  client_port=$port  run=$run_name"
-  CUDA_VISIBLE_DEVICES="$tgpu" XLA_PYTHON_CLIENT_MEM_FRACTION="$TRAIN_MEM_FRAC" \
-  WANDB_PROJECT="$WANDB_PROJECT" \
-    $PYTHON train_speedtune_async.py \
-      --config "$MODEL_CONFIG" \
-      --config.exec_backend "$be" \
-      --config.max_iters "$MAX_ITERS" \
-      --config.stream_hold_steps "$STREAM_HOLD_STEPS" \
-      --config_task "$TASK_CONFIG" \
-      --client_host localhost --client_port "$port" \
-      --seed "$SEED" \
-      --project_name "$WANDB_PROJECT" --run_name "$run_name" \
-      --output_dir "$LOGDIR" \
-      > "$LOGDIR/train_${be}.log" 2>&1 &
-  TRAIN_PIDS+=($!)
-  sleep 5
-done
-
-echo "[*] 训练中（MAX_ITERS=$MAX_ITERS）；只等 train 进程退出（server 常驻待 eval 复用）..."
-echo "[*] 实时查看：tail -f $LOGDIR/train_${BACKENDS[0]}.log"
-train_rc=0
-for i in "${!TRAIN_PIDS[@]}"; do
-  p="${TRAIN_PIDS[$i]}"; be="${BACKENDS[$i]}"
-  if wait "$p"; then echo "[$be] 训练完成 ✓"; else echo "[$be] 训练异常退出 ✗（见 train_${be}.log）" >&2; train_rc=1; fi
-done
-if [ "$train_rc" -ne 0 ]; then
-  echo "[ERROR] 有训练异常退出，跳过 eval。日志在 $LOGDIR" >&2
+if [ "$CLEANUP_SELF_TEST" = "1" ]; then
+  STAGE="cleanup self-test"
+  setsid sleep 60 &
+  pid=$!
+  ALL_PIDS+=("$pid"); ALL_LABELS+=("cleanup-self-test"); ALL_LOGS+=("$LOGDIR/cleanup-self-test.log")
+  echo "cleanup_self_test_pid=$pid"
+  kill -TERM "$$"
+  sleep 2
   exit 1
 fi
 
-# ---- 3) 自动发现各 backend 最新 checkpoint（循环，与 BACKENDS 对齐）----
-CKPTS=()
-for be in "${BACKENDS[@]}"; do
-  ck=$(ls -d "$LOGDIR/speedtune_${be}_${STAMP}/checkpoints/update_"* 2>/dev/null | sort -V | tail -1 || true)
-  if [ -z "$ck" ]; then
-    echo "[ERROR] 找不到 $be 的 checkpoint。看 $LOGDIR/train_${be}.log" >&2
-    exit 1
-  fi
-  echo "[*] CKPT $be = $ck"
-  CKPTS+=("$ck")
+wait_server() {
+  local pid="$1" port="$2" log="$3" backend="$4" elapsed=0
+  while [ "$elapsed" -lt "$SERVER_WAIT" ]; do
+    kill -0 "$pid" 2>/dev/null || { echo "[ERROR] $backend server exited"; tail -n 40 "$log"; return 1; }
+    grep -Eq "Render Error|address already in use|Traceback" "$log" && {
+      echo "[ERROR] $backend server initialization failed"; tail -n 40 "$log"; return 1;
+    }
+    if port_is_listening "$port"; then echo "[$backend] server ready on $port"; return 0; fi
+    sleep 2; elapsed=$((elapsed + 2))
+  done
+  echo "[ERROR] $backend server not ready after ${SERVER_WAIT}s"; tail -n 40 "$log"; return 1
+}
+
+echo "[*] backends=${BACKENDS[*]} episodes=$N_EPISODES logdir=$LOGDIR"
+STAGE="server startup"
+SERVER_PIDS=()
+for i in "${!BACKENDS[@]}"; do
+  be="${BACKENDS[$i]}"; port="${PORTS[$i]}"; gpu="${SERVER_GPUS[$i]}"
+  log="$LOGDIR/server_${be}.log"
+  setsid env CUDA_VISIBLE_DEVICES="$gpu" conda run --no-capture-output -n "$ROBOTWIN_ENV" \
+    python -m client_robotwin.run_robotwin_client \
+      --config_task_path "$TASK_CONFIG" --robotwin_root "$ROBOTWIN_ROOT" --server_port "$port" \
+      >"$log" 2>&1 &
+  pid=$!; SERVER_PIDS+=("$pid"); ALL_PIDS+=("$pid"); ALL_LABELS+=("server:$be"); ALL_LOGS+=("$log")
+done
+for i in "${!BACKENDS[@]}"; do
+  wait_server "${SERVER_PIDS[$i]}" "${PORTS[$i]}" "$LOGDIR/server_${BACKENDS[$i]}.log" "${BACKENDS[$i]}"
 done
 
-# ---- 4) eval（复用训练 server，不重起/不端口预检）----
+STAGE="training"
+TRAIN_PIDS=()
+for i in "${!BACKENDS[@]}"; do
+  be="${BACKENDS[$i]}"; port="${PORTS[$i]}"; gpu="${TRAIN_GPUS[$i]}"
+  run_name="speedtune_${be}_${STAMP}"; log="$LOGDIR/train_${be}.log"
+  setsid env CUDA_VISIBLE_DEVICES="$gpu" XLA_PYTHON_CLIENT_MEM_FRACTION="$TRAIN_MEM_FRAC" \
+    WANDB_PROJECT="$WANDB_PROJECT" "${PYTHON_CMD[@]}" train_speedtune_async.py \
+      --config "$MODEL_CONFIG" --config.exec_backend "$be" --config.max_iters "$MAX_ITERS" \
+      --config.stream_hold_steps "$STREAM_HOLD_STEPS" --config_task "$TASK_CONFIG" \
+      --client_host localhost --client_port "$port" --seed "$SEED" \
+      --project_name "$WANDB_PROJECT" --run_name "$run_name" --output_dir "$LOGDIR" \
+      >"$log" 2>&1 &
+  pid=$!; TRAIN_PIDS+=("$pid"); ALL_PIDS+=("$pid"); ALL_LABELS+=("train:$be"); ALL_LOGS+=("$log")
+  echo "[$be] train pid=$pid log=$log"
+done
+train_failed=0
+for i in "${!TRAIN_PIDS[@]}"; do
+  if wait "${TRAIN_PIDS[$i]}"; then echo "[${BACKENDS[$i]}] training complete"; else train_failed=1; fi
+done
+[ "$train_failed" -eq 0 ] || { echo "[ERROR] one or more training processes failed"; exit 1; }
+
+STAGE="checkpoint discovery"
+CKPTS=()
+for be in "${BACKENDS[@]}"; do
+  ck="$(find "$LOGDIR/speedtune_${be}_${STAMP}/checkpoints" -maxdepth 1 -type d -name 'update_*' 2>/dev/null | sort -V | tail -1)"
+  [ -n "$ck" ] || { echo "[ERROR] checkpoint not found for $be"; exit 1; }
+  require_path "$ck/speedtune_metadata.json" "checkpoint metadata for $be"
+  CKPTS+=("$ck"); echo "[$be] checkpoint=$ck"
+done
+
+STAGE="evaluation"
+EVAL_LOG="$OUTPUT_DIR/eval.log"
 if [ "${#BACKENDS[@]}" -eq 2 ]; then
-  echo "[*] 启动 2 路对比 eval  compare_GPU=$COMPARE_GPU（A=${BACKENDS[0]} / B=${BACKENDS[1]}，复用 server）"
-  CUDA_VISIBLE_DEVICES="$COMPARE_GPU" XLA_PYTHON_CLIENT_MEM_FRACTION="$COMPARE_MEM_FRAC" \
-    $PYTHON eval_speedtune_compare.py \
-      --config "$MODEL_CONFIG" \
-      --config_task "$TASK_CONFIG" \
+  setsid env CUDA_VISIBLE_DEVICES="$COMPARE_GPU" XLA_PYTHON_CLIENT_MEM_FRACTION="$COMPARE_MEM_FRAC" \
+    "${PYTHON_CMD[@]}" eval_speedtune_compare.py --config "$MODEL_CONFIG" --config_task "$TASK_CONFIG" \
       --config.stream_hold_steps "$STREAM_HOLD_STEPS" \
       --backend_a "${BACKENDS[0]}" --ckpt_a "${CKPTS[0]}" --port_a "${PORTS[0]}" \
       --backend_b "${BACKENDS[1]}" --ckpt_b "${CKPTS[1]}" --port_b "${PORTS[1]}" \
-      --n_episodes "$N_EPISODES" --seed "$SEED" \
-      --max_decision_steps "$MAX_DECISION_STEPS" \
-      --client_host localhost \
-      --output_dir "$OUTPUT_DIR" \
-      2>&1 | tee "$OUTPUT_DIR/compare.log"
+      --n_episodes "$N_EPISODES" --seed "$SEED" --max_decision_steps "$MAX_DECISION_STEPS" \
+      --norecord_video --client_host localhost --output_dir "$OUTPUT_DIR" >"$EVAL_LOG" 2>&1 &
 else
-  be="${BACKENDS[0]}"
-  echo "[*] 单 backend eval（$be）  eval_GPU=$COMPARE_GPU（复用 server）"
-  CUDA_VISIBLE_DEVICES="$COMPARE_GPU" XLA_PYTHON_CLIENT_MEM_FRACTION="$COMPARE_MEM_FRAC" \
-    $PYTHON eval_speedtune.py \
-      --config "$MODEL_CONFIG" \
-      --config.exec_backend "$be" \
-      --config.stream_hold_steps "$STREAM_HOLD_STEPS" \
-      --config_task "$TASK_CONFIG" \
-      --dqn_ckpt "${CKPTS[0]}" \
-      --n_episodes "$N_EPISODES" --seed "$SEED" \
-      --max_decision_steps "$MAX_DECISION_STEPS" \
-      --client_host localhost --client_port "${PORTS[0]}" \
-      --output_dir "$OUTPUT_DIR" \
-      2>&1 | tee "$OUTPUT_DIR/eval_${be}.log"
+  setsid env CUDA_VISIBLE_DEVICES="$COMPARE_GPU" XLA_PYTHON_CLIENT_MEM_FRACTION="$COMPARE_MEM_FRAC" \
+    "${PYTHON_CMD[@]}" eval_speedtune.py --config "$MODEL_CONFIG" \
+      --config.exec_backend "${BACKENDS[0]}" --config.stream_hold_steps "$STREAM_HOLD_STEPS" \
+      --config_task "$TASK_CONFIG" --dqn_ckpt "${CKPTS[0]}" --client_port "${PORTS[0]}" \
+      --n_episodes "$N_EPISODES" --seed "$SEED" --max_decision_steps "$MAX_DECISION_STEPS" \
+      --norecord_video --client_host localhost --output_dir "$OUTPUT_DIR" >"$EVAL_LOG" 2>&1 &
 fi
+pid=$!; ALL_PIDS+=("$pid"); ALL_LABELS+=("eval"); ALL_LOGS+=("$EVAL_LOG")
+if ! wait "$pid"; then echo "[ERROR] eval failed"; tail -n 80 "$EVAL_LOG"; exit 1; fi
 
-echo ""
-echo "[*] 全部完成。训练日志: $LOGDIR ; 对比结果: $OUTPUT_DIR"
-echo "    - compare_summary.json / compare_speedup.png / compare_knob.png"
-echo "    - <backend>/videos/ + <backend>/episode*_speed.{json,png}"
+STAGE="complete"
+echo "[*] complete: training=$LOGDIR eval=$OUTPUT_DIR"
