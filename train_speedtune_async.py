@@ -18,8 +18,8 @@
 
 import os
 import logging
+import queue
 import threading
-import time
 
 import numpy as np
 import tqdm
@@ -41,11 +41,15 @@ from expo_ft.speedtune.exec_backends import build_backend, parse_force_limit
 from expo_ft.speedtune.runtime_config import (
     backend_k_skip,
     backend_support,
-    episode_reward_success,
 )
 from expo_ft.speedtune.checkpoint_contract import (
     build_checkpoint_metadata,
     write_checkpoint_metadata,
+)
+from expo_ft.speedtune.training_runtime import (
+    flush_pending_episode,
+    run_episode_updates,
+    update_ready,
 )
 
 import warnings
@@ -229,9 +233,9 @@ def main(_):
     checkpoint_metadata = build_checkpoint_metadata(config, backend)
 
     batch_size = int(config.batch_size)
-    learning_starts = int(config.learning_starts)
     utd_ratio = int(config.utd_ratio)                    # P: 每次 update 调用的梯度步数
     update_per_episode = int(config.update_per_episode)  # 每 episode 的 update 调用次数
+    warmup_episodes = int(config.get("warmup_episodes", 10))
     max_iters = int(config.max_iters)
     log_every = 50   # wandb 训练/动作指标按决策步节流（统一 step=it，合并去重，防"一下子十万步"）
 
@@ -239,13 +243,23 @@ def main(_):
     _buf_lock = threading.Lock()
     _published = [None]
     _publish_lock = threading.Lock()
-    _stop = threading.Event()
     _step = [0]          # 全局决策步计数（epsilon/beta schedule + 统一 wandb step）
     _n_updates = [0]
     _episode = [0]                       # 已完成 episode 数（rollout 横轴）
     _train_metrics = [None]              # update 线程暂存最新聚合 metrics，主线程统一 log(step=it)
-    _can_update = threading.Event()      # buffer ready 才开 update（前期不空转）
-    _new_episode = threading.Event()     # 每 episode 末放行一批 update（per-episode 控速）
+    # Queue 是计数信号：每个已完成 episode 保留一个 token，不会像 Event 一样合并通知。
+    _episode_updates = queue.Queue()
+    _update_sentinel = object()
+    _worker_error = [None]
+
+    def _checkpoint_metadata_snapshot():
+        return {
+            **checkpoint_metadata,
+            "training_mode": "async",
+            "decision_steps": _step[0],
+            "completed_episodes": _episode[0],
+            "gradient_updates": _n_updates[0],
+        }
 
     def _publish(lr):
         with _publish_lock:
@@ -263,36 +277,50 @@ def main(_):
         utd_ratio 个梯度步（各自 PER 采样 + 回写优先级）→ 每 episode 共 update_per_episode×utd_ratio
         个梯度步。metrics 聚合后交主线程统一 log(step=it)，不在本线程 log（避免多线程 step 冲突）。"""
         learner_lr = learner
-        _can_update.wait()                                  # buffer 未 ready 前阻塞，不空转
-        while not _stop.is_set():
-            if not _new_episode.wait(timeout=1.0):          # 等一个完整 episode 的数据（控速 + 防 stale）
-                continue
-            _new_episode.clear()
-            beta = _beta_at(_step[0], config)
-            agg = []
-            for _ in range(update_per_episode):             # 每 episode update_per_episode 次 update 调用
-                for _ in range(utd_ratio):                  # P: 每次调用 utd_ratio 个梯度步
-                    with _buf_lock:
-                        batch = buffer.sample(batch_size, beta=beta)
-                    learner_lr, td, metrics = learner_lr.update(batch)
-                    with _buf_lock:
-                        buffer.update_priorities(batch["tree_indices"], np.asarray(td))
-                    _n_updates[0] += 1
-                    agg.append(metrics)
-                _publish(learner_lr)                        # 每次调用后发布参数给 actor
-            # 聚合本 episode 全部梯度步 metrics（均值），交主线程统一 log(step=it)。
-            keys = [k for k, v in agg[0].items()
-                    if np.isscalar(v) or getattr(v, "ndim", 1) == 0]
-            tm = {f"training/{k}": float(np.mean([float(m[k]) for m in agg])) for k in keys}
-            tm["training/per_beta"] = beta
-            tm["training/n_updates"] = _n_updates[0]
-            tm["training/replay_ratio"] = _n_updates[0] / max(_step[0], 1)
-            _train_metrics[0] = tm
-            if FLAGS.checkpoint_model and FLAGS.checkpoint_interval > 0 \
-                    and _n_updates[0] % FLAGS.checkpoint_interval == 0:
-                _save_checkpoint(log_dir, learner_lr, _n_updates[0], checkpoint_metadata)
-        _save_checkpoint(log_dir, learner_lr, _n_updates[0], checkpoint_metadata)
-        logging.info("Update thread exiting after %d updates.", _n_updates[0])
+        try:
+            while True:
+                episode_step = _episode_updates.get()
+                if episode_step is _update_sentinel:
+                    _episode_updates.task_done()
+                    break
+                beta = _beta_at(episode_step, config)
+
+                class _LockedBuffer:
+                    def sample(self, size, beta):
+                        with _buf_lock:
+                            return buffer.sample(size, beta=beta)
+
+                    def update_priorities(self, tree_indices, td):
+                        with _buf_lock:
+                            buffer.update_priorities(tree_indices, td)
+
+                learner_lr, agg, count = run_episode_updates(
+                    learner_lr, _LockedBuffer(), batch_size=batch_size, beta=beta,
+                    update_groups=update_per_episode, utd_ratio=utd_ratio,
+                    on_group_end=_publish,
+                )
+                _n_updates[0] += count
+                # 聚合本 episode 全部梯度步 metrics（均值），交主线程统一 log(step=it)。
+                tm = {f"training/{key}": value for key, value in agg.items()}
+                tm["training/per_beta"] = beta
+                tm["training/n_updates"] = _n_updates[0]
+                tm["training/replay_ratio"] = _n_updates[0] / max(episode_step, 1)
+                _train_metrics[0] = tm
+                if FLAGS.checkpoint_model and FLAGS.checkpoint_interval > 0 \
+                        and _n_updates[0] % FLAGS.checkpoint_interval == 0:
+                    _save_checkpoint(
+                        log_dir, learner_lr, _n_updates[0],
+                        _checkpoint_metadata_snapshot(),
+                    )
+                _episode_updates.task_done()
+        except BaseException as exc:
+            _worker_error[0] = exc
+            logging.exception("SpeedTune async update worker failed")
+        finally:
+            _save_checkpoint(
+                log_dir, learner_lr, _n_updates[0], _checkpoint_metadata_snapshot()
+            )
+            logging.info("Update thread exiting after %d updates.", _n_updates[0])
 
     _thread = threading.Thread(target=_update_worker, daemon=True)
     _thread.start()
@@ -306,31 +334,32 @@ def main(_):
     ep_returns, ep_reward_returns, ep_lens, ep_exec_time, ep_dense = [], [], [], [], []
     _fallbacks = [0, 0]   # [topp_fallback 次数, 总 chunk 次数] → fallback 率
 
-    def _flush_episode():
+    def _flush_episode(*, force_terminal=False):
         """episode 结束：success-gated 回填 reward，按时序写入 buffer + 统计执行时间。"""
         nonlocal pending, ep_success, ep_speed_violation
         if not pending:
-            return
-        reward_success = episode_reward_success(
-            backend.name, ep_success, ep_speed_violation
-        )
+            return None
         with _buf_lock:
-            for t, p in enumerate(pending):
-                next_feat = pending[t + 1]["feat"] if t + 1 < len(pending) else p["feat"]
-                r = backend.total_reward(p["r_task"], reward_success, p["v_list"])
-                buffer.insert(p["feat"], p["action_idxs"], r, next_feat, p["done"])
-        ep_returns.append(bool(ep_success))
-        ep_reward_returns.append(bool(reward_success))
-        ep_lens.append(len(pending))
-        ep_exec_time.append(float(sum(p["duration"] for p in pending)))   # episode 总 TOPPRA 执行时长(s)
-        ep_dense.append(int(sum(p["n_exec"] for p in pending)))           # episode 总仿真帧数
+            summary = flush_pending_episode(
+                pending, buffer, backend, task_success=ep_success,
+                speed_violation=ep_speed_violation,
+                force_terminal=force_terminal,
+            )
+        ep_returns.append(summary["task_success"])
+        ep_reward_returns.append(summary["reward_success"])
+        ep_lens.append(summary["length"])
+        ep_exec_time.append(summary["exec_time_s"])
+        ep_dense.append(summary["dense_steps"])
         pending = []
         ep_success = False
         ep_speed_violation = False
+        return summary
 
     try:
         for it in tqdm.tqdm(range(max_iters), disable=not FLAGS.tqdm):
-            _step[0] = it
+            if _worker_error[0] is not None:
+                raise RuntimeError("SpeedTune async update worker failed") from _worker_error[0]
+            _step[0] = it + 1
             actor_lr = _pickup(actor_lr).replace(epsilon=_epsilon_at(it, config))
 
             obs_m = preprocess(obs)
@@ -379,11 +408,14 @@ def main(_):
             if done:
                 _flush_episode()
                 _episode[0] += 1
-                # buffer ready 后：开 update 线程 + 放行本 episode 的 update_per_episode×utd_ratio 个梯度步。
-                if buffer.ready(learning_starts):
-                    if not _can_update.is_set():
-                        _can_update.set()
-                    _new_episode.set()
+                # 与 train_pi_robo 对齐：至少 10 个完整 episode 且 replay 足够一个 batch。
+                with _buf_lock:
+                    ready = update_ready(
+                        completed_episodes=_episode[0], replay_size=len(buffer),
+                        batch_size=batch_size, warmup_episodes=warmup_episodes,
+                    )
+                if ready:
+                    _episode_updates.put(_step[0])
                 if ep_returns:
                     fb_rate = _fallbacks[0] / max(_fallbacks[1], 1)
                     wandb.log({"rollout/success_rate": float(np.mean(ep_returns[-50:])),
@@ -397,12 +429,13 @@ def main(_):
                                "episode": _episode[0]},      # rollout 横轴 = episode
                               step=it)
     finally:
-        _flush_episode()
-        _stop.set()
-        _can_update.set()     # 解除 update 线程 _can_update.wait() 阻塞（buffer 从未 ready 的边界）
-        _new_episode.set()    # 解除 _new_episode.wait() 阻塞，让线程跑完 final checkpoint
-        _thread.join(timeout=120)
+        _flush_episode(force_terminal=True)
+        # sentinel 排在所有 episode token 后面；worker 先完整消费每个 episode 的 6×UTD 更新。
+        _episode_updates.put(_update_sentinel)
+        _thread.join()
         logging.info("SpeedTune async training finished after %d decision steps.", _step[0])
+    if _worker_error[0] is not None:
+        raise RuntimeError("SpeedTune async update worker failed") from _worker_error[0]
 
 
 def _save_checkpoint(log_dir, learner, step, metadata):

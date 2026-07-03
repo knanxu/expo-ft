@@ -47,7 +47,11 @@ from expo_ft.speedtune.runtime_config import (
     backend_support,
     episode_reward_success,
 )
-from expo_ft.speedtune.paired_eval import noise_seed
+from expo_ft.speedtune.paired_eval import (
+    diagnostic_episode_reason,
+    noise_seed,
+    select_diagnostic_episode_ids,
+)
 from expo_ft.speedtune.checkpoint_contract import (
     build_checkpoint_metadata,
     validate_checkpoint_metadata,
@@ -67,6 +71,7 @@ flags.DEFINE_string("output_dir", "./logs/speedtune_eval", "输出目录（视�
 flags.DEFINE_string("client_host", "localhost", "Env server host.")
 flags.DEFINE_integer("client_port", 8102, "Env server port.")
 flags.DEFINE_boolean("record_video", False, "是否录制 episode 视频；严格墙钟计时默认关闭。")
+flags.DEFINE_integer("video_episodes", 5, "主计时结束后重放并录制的诊断 episode 数。")
 flags.DEFINE_boolean("resume", False, "build_pi05 resume（一般 False）。")
 flags.DEFINE_integer("fsdp_devices", 1, "FSDP devices for sharding（eval VLA 冻结，单卡即可）。")
 
@@ -232,7 +237,8 @@ def _save_and_plot(out_dir, ep, recs, ep_success=None):
 
 def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
                          n_episodes, max_decision_steps, seed, out_dir, record_video,
-                         k_skip=None):
+                         k_skip=None, video_episode_ids=None,
+                         save_episode_artifacts=True):
     """跑 n_episodes（录视频 + 逐 chunk 记录 + 每 episode _save_and_plot），返回聚合 result dict。
 
     Args:
@@ -260,7 +266,10 @@ def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
     env.reseed(seed)
     for ep in range(n_episodes):
         obs = env.reset()
-        if record_video:
+        record_this_video = bool(record_video) and (
+            video_episode_ids is None or ep in video_episode_ids
+        )
+        if record_this_video:
             env.start_video(ep)
         recs, t_acc, planned_time, ep_success = [], 0.0, 0.0, False
         ep_speed_violation = False
@@ -310,6 +319,8 @@ def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
                 right_gripper=float(info.get("right_gripper", 0.0)),
                 left_contact=lc, right_contact=rc,
                 exec_status=info.get("exec_status", "success"), success=bool(success),
+                input_chunk_steps=int(info.get("input_chunk_steps", real_chunk.shape[0])),
+                requested_execution_steps=int(info.get("requested_execution_steps", k_skip or real_chunk.shape[0])),
                 execution_steps=int(info.get("execution_steps", 0)),
                 planned_cruise_fraction=float(info.get("planned_cruise_fraction", 0.0)),
                 fixed_time_speed_violation=bool(info.get("fixed_time_speed_violation", False)),
@@ -336,7 +347,7 @@ def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
             exec_backend, ep_success, ep_speed_violation
         )
 
-        if record_video:
+        if record_this_video:
             env.stop_video()
             _tag = "SUCCESS" if ep_success else "FAIL"
             try:  # 视频名加 success/fail 后缀（同机共享 video_dir；失败仅警告不中断）
@@ -347,7 +358,8 @@ def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
                 logging.warning("[%s] episode%d video rename 失败(忽略): %s", exec_backend, ep, _e)
         n_succ += int(ep_success)
         n_reward_succ += int(ep_reward_success)
-        _save_and_plot(out_dir, ep, recs, ep_success)
+        if save_episode_artifacts:
+            _save_and_plot(out_dir, ep, recs, ep_success)
         ep_dense = int(sum(int(r["dense_steps"]) for r in recs))
         fallback_count = sum(r["exec_status"] == "topp_fallback" for r in recs)
         cruise_fraction = (
@@ -398,6 +410,12 @@ def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
         k_skip=k_skip,
         acc_rule=(WHOLE_CHUNK_ACC_RULE if exec_backend == "chunk_toppra" else None),
         speed_action_counts=action_counts,
+        mean_decision_steps=(float(np.mean([e["n_decision_steps"] for e in episodes]))
+                             if episodes else 0.0),
+        mean_decision_steps_success=(
+            float(np.mean([e["n_decision_steps"] for e in succ_eps]))
+            if succ_eps else float("nan")
+        ),
         mean_dense_steps=float(np.mean([e["total_dense_steps"] for e in episodes])) if episodes else 0.0,
         mean_sim_time_s=float(np.mean([e["sim_time_s"] for e in episodes])) if episodes else 0.0,
         mean_end_to_end_wall_s=(float(np.mean([e["end_to_end_wall_s"] for e in episodes]))
@@ -415,6 +433,44 @@ def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
         episodes=episodes,
     )
     return result
+
+
+def _run_single_video_replay(
+    env, vla, dqnpack, exec_backend, primary_result, *,
+    max_decision_steps, seed, out_dir, k_skip, limit,
+):
+    selected = select_diagnostic_episode_ids(
+        primary_result["episodes"], limit=limit
+    )
+    if not selected:
+        return []
+    logging.info("Diagnostic video replay episode ids: %s", selected)
+    replay = run_backend_episodes(
+        env, vla, dqnpack["backend"], dqnpack["learner"], exec_backend,
+        n_episodes=max(selected) + 1, max_decision_steps=max_decision_steps,
+        seed=seed, out_dir=out_dir, record_video=True,
+        video_episode_ids=set(selected), save_episode_artifacts=False,
+        k_skip=k_skip,
+    )
+    primary = {int(item["ep"]): item for item in primary_result["episodes"]}
+    replay_by_id = {int(item["ep"]): item for item in replay["episodes"]}
+    manifest = []
+    for episode in selected:
+        initial = primary[episode]
+        repeated = replay_by_id[episode]
+        tag = "SUCCESS" if repeated["task_success"] else "FAIL"
+        manifest.append({
+            "episode": episode,
+            "seed": initial["seed"],
+            "reason": diagnostic_episode_reason(primary, primary, episode),
+            "primary_task_success": initial["task_success"],
+            "primary_reward_success": initial["reward_success"],
+            "replay_task_success": repeated["task_success"],
+            "video": os.path.join("videos", f"episode{episode}_{tag}.mp4"),
+        })
+    with open(os.path.join(out_dir, "video_manifest.json"), "w") as file:
+        json.dump({"selected_episode_ids": selected, "episodes": manifest}, file, indent=2)
+    return manifest
 
 
 def main(_):
@@ -457,7 +513,7 @@ def main(_):
     result = run_backend_episodes(
         env, vla, dqnpack["backend"], dqnpack["learner"], exec_backend,
         n_episodes=FLAGS.n_episodes, max_decision_steps=FLAGS.max_decision_steps,
-        seed=FLAGS.seed, out_dir=out_dir, record_video=FLAGS.record_video,
+        seed=FLAGS.seed, out_dir=out_dir, record_video=False,
         k_skip=backend_k_skip(config, exec_backend),
     )
 
@@ -478,6 +534,8 @@ def main(_):
         "fallback_rate": result["fallback_rate"],
         "k_skip": result["k_skip"], "acc_rule": result["acc_rule"],
         "speed_action_counts": result["speed_action_counts"],
+        "mean_decision_steps": result["mean_decision_steps"],
+        "mean_decision_steps_success": result["mean_decision_steps_success"],
         "aggr_in_contact_mean": result["aggr_in_contact_mean"],
         "aggr_free_mean": result["aggr_free_mean"],
         "decel_near_contact": result["decel_near_contact"],
@@ -485,6 +543,13 @@ def main(_):
     }
     with open(os.path.join(out_dir, "eval_summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
+    if FLAGS.record_video and FLAGS.video_episodes > 0:
+        _run_single_video_replay(
+            env, vla, dqnpack, exec_backend, result,
+            max_decision_steps=FLAGS.max_decision_steps, seed=FLAGS.seed,
+            out_dir=out_dir, k_skip=backend_k_skip(config, exec_backend),
+            limit=FLAGS.video_episodes,
+        )
     logging.info("==== SpeedTune eval 汇总 (%s) ====", exec_backend)
     logging.info("success: %d/%d (%.0f%%)", result["success"], result["n_episodes"],
                  100 * result["success_rate"])

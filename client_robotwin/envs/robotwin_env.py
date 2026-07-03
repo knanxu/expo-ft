@@ -370,7 +370,7 @@ class RoboTwinEnv:
     }
 
     @staticmethod
-    def _call_backend(fn, chunk, **kwargs):
+    def _call_backend(fn, chunk, *, required_kwargs=(), **kwargs):
         """只传 fn 实际接受的 kwargs，适配不同 RoboTwin 版本的后端签名。
 
         不同 RoboTwin 分支的 take_chunk_action_* 签名可能不同（例如有/无 ``max_actions``、
@@ -380,8 +380,23 @@ class RoboTwinEnv:
         params = inspect.signature(fn).parameters
         if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
             return fn(chunk, **kwargs)
+        missing = [name for name in required_kwargs if name not in params]
+        if missing:
+            raise RuntimeError(
+                "RoboTwin executor contract is stale: "
+                f"{fn.__name__} does not accept {missing}. Pull the matching RoboTwin commit."
+            )
         accepted = {k: val for k, val in kwargs.items() if k in params}
         return fn(chunk, **accepted)
+
+    @staticmethod
+    def _require_info_fields(info, backend, fields):
+        missing = [name for name in fields if name not in info]
+        if missing:
+            raise RuntimeError(
+                f"RoboTwin executor contract is stale for {backend}: missing {missing}. "
+                "Pull the matching RoboTwin commit before training or eval."
+            )
 
     def step_chunk(self, chunk, speed_params=None, exec_backend=None) -> Dict[str, Any]:
         """整段执行一个 action chunk + 速度控制参数（SpeedTune 决策粒度）。
@@ -420,9 +435,26 @@ class RoboTwinEnv:
                                       max_actions=self._k_skip, video_save_freq=vsf)
         else:  # whole_chunk：先取 execution_steps 帧，再 spline/TOPPRA；acc=4*vel² 在执行层派生
             info = self._call_backend(self.env.take_chunk_action, chunk,
+                                      required_kwargs=("execution_steps",),
                                       vel_limit=vel_limit, execution_steps=self._k_skip,
                                       video_save_freq=vsf)
         info = info or {}
+        if rt == "streaming":
+            self._require_info_fields(
+                info, backend,
+                ("fixed_time_speed_violation", "max_planned_qvel"),
+            )
+        elif rt == "whole_chunk":
+            self._require_info_fields(
+                info, backend,
+                ("vel_limit", "acc_limit", "execution_steps", "planned_cruise_fraction"),
+            )
+            expected_acc = 4.0 * vel_limit ** 2
+            if not np.isclose(float(info["acc_limit"]), expected_acc):
+                raise RuntimeError(
+                    "RoboTwin executor contract mismatch: "
+                    f"acc_limit={info['acc_limit']} but expected 4*vel_limit^2={expected_acc}."
+                )
         # episode 预算按消耗的 action 数累加（与 RoboTwin step_lim 同语义；后端内部也自查 step_lim）。
         self._steps_since_reset += int(info.get("take_action_cnt_delta", 0) or 0)
         lg, rg, lc, rc = self._contact_info()
@@ -437,6 +469,8 @@ class RoboTwinEnv:
             "planned_cruise_fraction": float(info.get("planned_cruise_fraction", 0.0) or 0.0),
             "fixed_time_speed_violation": bool(info.get("fixed_time_speed_violation", False)),
             "max_planned_qvel": float(info.get("max_planned_qvel", 0.0) or 0.0),
+            "input_chunk_steps": int(chunk.shape[0]),
+            "requested_execution_steps": int(self._k_skip or chunk.shape[0]),
         }
         if "vel_limit" in info:
             result["vel_limit"] = float(info["vel_limit"])

@@ -20,10 +20,25 @@ TRAIN_MEM_FRAC="${TRAIN_MEM_FRAC:-0.85}"
 COMPARE_MEM_FRAC="${COMPARE_MEM_FRAC:-0.85}"
 STREAM_HOLD_STEPS="${STREAM_HOLD_STEPS:-15}"
 N_EPISODES="${N_EPISODES:-30}"
+VIDEO_EPISODES="${VIDEO_EPISODES:-5}"
 MAX_DECISION_STEPS="${MAX_DECISION_STEPS:-400}"
 DRY_RUN="${DRY_RUN:-0}"
 CLEANUP_SELF_TEST="${CLEANUP_SELF_TEST:-0}"
 COMPARE_GPU="${COMPARE_GPU:-1}"
+
+if [ -n "${TRAIN_MODE:-}" ]; then
+  :
+elif [ -t 0 ] && [ "$DRY_RUN" != "1" ]; then
+  read -r -p "TRAIN_MODE [sync] (sync/async): " TRAIN_MODE
+  TRAIN_MODE="${TRAIN_MODE:-sync}"
+else
+  TRAIN_MODE="sync"
+fi
+case "$TRAIN_MODE" in
+  sync) TRAIN_ENTRY="train_speedtune_sync.py" ;;
+  async) TRAIN_ENTRY="train_speedtune_async.py" ;;
+  *) echo "[ERROR] TRAIN_MODE must be sync or async, got '$TRAIN_MODE'" >&2; exit 2 ;;
+esac
 
 export SPEEDTUNE_FORCE_LIMIT="${SPEEDTUNE_FORCE_LIMIT:-30,40,30,15,10,10}"
 : "${SPEEDTUNE_VLA_CKPT:?export SPEEDTUNE_VLA_CKPT=<frozen pi0.5 checkpoint>}"
@@ -76,6 +91,10 @@ if [ -n "$SPEEDTUNE_VLA_ASSETS" ]; then require_path "$SPEEDTUNE_VLA_ASSETS" SPE
 command -v "${PYTHON_CMD[0]}" >/dev/null || { echo "[ERROR] missing command: ${PYTHON_CMD[0]}" >&2; exit 2; }
 command -v conda >/dev/null || { echo "[ERROR] missing conda" >&2; exit 2; }
 command -v setsid >/dev/null || { echo "[ERROR] missing setsid" >&2; exit 2; }
+command -v git >/dev/null || { echo "[ERROR] missing git" >&2; exit 2; }
+
+EXPO_COMMIT="$(git -C "$EXPO_ROOT" rev-parse HEAD)"
+ROBOTWIN_COMMIT="$(git -C "$ROBOTWIN_ROOT" rev-parse HEAD)"
 
 port_is_free() {
   python - "$1" <<'PY'
@@ -119,6 +138,11 @@ OUTPUT_DIR="$LOGDIR/compare_eval"
 if [ "$DRY_RUN" = "1" ]; then
   echo "[DRY-RUN] backends: ${BACKENDS[*]}"
   echo "[DRY-RUN] n_episodes: $N_EPISODES"
+  echo "[DRY-RUN] video_episodes: $VIDEO_EPISODES"
+  echo "[DRY-RUN] train_mode: $TRAIN_MODE"
+  echo "[DRY-RUN] trainer: $TRAIN_ENTRY"
+  echo "[DRY-RUN] expo_commit: $EXPO_COMMIT"
+  echo "[DRY-RUN] robotwin_commit: $ROBOTWIN_COMMIT"
   for i in "${!BACKENDS[@]}"; do
     echo "[DRY-RUN] server backend=${BACKENDS[$i]} gpu=${SERVER_GPUS[$i]} port=${PORTS[$i]}"
     echo "[DRY-RUN] train backend=${BACKENDS[$i]} gpu=${TRAIN_GPUS[$i]} config.exec_backend=${BACKENDS[$i]}"
@@ -190,7 +214,8 @@ wait_server() {
   echo "[ERROR] $backend server not ready after ${SERVER_WAIT}s"; tail -n 40 "$log"; return 1
 }
 
-echo "[*] backends=${BACKENDS[*]} episodes=$N_EPISODES logdir=$LOGDIR"
+echo "[*] backends=${BACKENDS[*]} train_mode=$TRAIN_MODE episodes=$N_EPISODES videos=$VIDEO_EPISODES logdir=$LOGDIR"
+echo "[*] expo_commit=$EXPO_COMMIT robotwin_commit=$ROBOTWIN_COMMIT"
 STAGE="server startup"
 SERVER_PIDS=()
 for i in "${!BACKENDS[@]}"; do
@@ -210,9 +235,9 @@ STAGE="training"
 TRAIN_PIDS=()
 for i in "${!BACKENDS[@]}"; do
   be="${BACKENDS[$i]}"; port="${PORTS[$i]}"; gpu="${TRAIN_GPUS[$i]}"
-  run_name="speedtune_${be}_${STAMP}"; log="$LOGDIR/train_${be}.log"
+  run_name="speedtune_${TRAIN_MODE}_${be}_${STAMP}"; log="$LOGDIR/train_${be}.log"
   setsid env CUDA_VISIBLE_DEVICES="$gpu" XLA_PYTHON_CLIENT_MEM_FRACTION="$TRAIN_MEM_FRAC" \
-    WANDB_PROJECT="$WANDB_PROJECT" "${PYTHON_CMD[@]}" train_speedtune_async.py \
+    WANDB_PROJECT="$WANDB_PROJECT" "${PYTHON_CMD[@]}" "$TRAIN_ENTRY" \
       --config "$MODEL_CONFIG" --config.exec_backend "$be" --config.max_iters "$MAX_ITERS" \
       --config.stream_hold_steps "$STREAM_HOLD_STEPS" --config_task "$TASK_CONFIG" \
       --client_host localhost --client_port "$port" --seed "$SEED" \
@@ -230,7 +255,7 @@ done
 STAGE="checkpoint discovery"
 CKPTS=()
 for be in "${BACKENDS[@]}"; do
-  ck="$(find "$LOGDIR/speedtune_${be}_${STAMP}/checkpoints" -maxdepth 1 -type d -name 'update_*' 2>/dev/null | sort -V | tail -1)"
+  ck="$(find "$LOGDIR/speedtune_${TRAIN_MODE}_${be}_${STAMP}/checkpoints" -maxdepth 1 -type d -name 'update_*' 2>/dev/null | sort -V | tail -1)"
   [ -n "$ck" ] || { echo "[ERROR] checkpoint not found for $be"; exit 1; }
   require_path "$ck/speedtune_metadata.json" "checkpoint metadata for $be"
   CKPTS+=("$ck"); echo "[$be] checkpoint=$ck"
@@ -245,14 +270,16 @@ if [ "${#BACKENDS[@]}" -eq 2 ]; then
       --backend_a "${BACKENDS[0]}" --ckpt_a "${CKPTS[0]}" --port_a "${PORTS[0]}" \
       --backend_b "${BACKENDS[1]}" --ckpt_b "${CKPTS[1]}" --port_b "${PORTS[1]}" \
       --n_episodes "$N_EPISODES" --seed "$SEED" --max_decision_steps "$MAX_DECISION_STEPS" \
-      --norecord_video --client_host localhost --output_dir "$OUTPUT_DIR" >"$EVAL_LOG" 2>&1 &
+      --record_video --video_episodes "$VIDEO_EPISODES" \
+      --client_host localhost --output_dir "$OUTPUT_DIR" >"$EVAL_LOG" 2>&1 &
 else
   setsid env CUDA_VISIBLE_DEVICES="$COMPARE_GPU" XLA_PYTHON_CLIENT_MEM_FRACTION="$COMPARE_MEM_FRAC" \
     "${PYTHON_CMD[@]}" eval_speedtune.py --config "$MODEL_CONFIG" \
       --config.exec_backend "${BACKENDS[0]}" --config.stream_hold_steps "$STREAM_HOLD_STEPS" \
       --config_task "$TASK_CONFIG" --dqn_ckpt "${CKPTS[0]}" --client_port "${PORTS[0]}" \
       --n_episodes "$N_EPISODES" --seed "$SEED" --max_decision_steps "$MAX_DECISION_STEPS" \
-      --norecord_video --client_host localhost --output_dir "$OUTPUT_DIR" >"$EVAL_LOG" 2>&1 &
+      --record_video --video_episodes "$VIDEO_EPISODES" \
+      --client_host localhost --output_dir "$OUTPUT_DIR" >"$EVAL_LOG" 2>&1 &
 fi
 pid=$!; ALL_PIDS+=("$pid"); ALL_LABELS+=("eval"); ALL_LOGS+=("$EVAL_LOG")
 if ! wait "$pid"; then echo "[ERROR] eval failed"; tail -n 80 "$EVAL_LOG"; exit 1; fi

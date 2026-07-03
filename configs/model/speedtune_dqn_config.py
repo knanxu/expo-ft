@@ -80,7 +80,8 @@ def get_config():
     # --- replay / 训练循环 ---
     config.buffer_capacity = 100000
     config.batch_size = 64
-    config.learning_starts = 1000        # buffer 攒够多少决策步才开始训
+    config.learning_starts = 1000        # 旧 async checkpoint 配置兼容；新 trainer 不再用它作启动门槛
+    config.warmup_episodes = 10          # 对齐 train_pi_robo：至少完成 10 个 episode 后开始更新
     # P 方式 replay（值据 expo-ft 论文超参确定）：每 episode 末做 update_per_episode 次 update 调用，
     # 每次 utd_ratio 个梯度步 → 每 episode 共 update_per_episode×utd_ratio 个梯度步。
     config.utd_ratio = 20                # 每次 update 调用的梯度步数（P: 循环 utd_ratio 次 learner.update）
@@ -93,7 +94,9 @@ def get_config():
     config.reward_beta = 2.0
 
     # --- 杂项 ---
-    config.max_iters = 40000             # training step = 一次 chunk 执行(决策步)，跑 40000 个
+    # 终止预算对齐 train_pi_robo 的环境交互步：一次 step = 一次 VLA+DQN 决策和 env.step_chunk；
+    # 不按 gradient update 数或 chunk 内 250Hz dense simulation steps 计数。
+    config.max_iters = 40000
     config.seed = 0
 
     return config

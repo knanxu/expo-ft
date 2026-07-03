@@ -35,7 +35,11 @@ import etils.epath as epath
 import openpi.training.sharding as openpi_sharding
 from expo_ft.env.env_client import EnvClientWrapper
 from expo_ft.speedtune.exec_backends import parse_force_limit
-from expo_ft.speedtune.paired_eval import paired_metrics
+from expo_ft.speedtune.paired_eval import (
+    diagnostic_episode_reason,
+    paired_metrics,
+    select_diagnostic_episode_ids,
+)
 from expo_ft.utils.train_utils import init_logging
 
 # 复用 eval_speedtune 的可复用单元（import 会触发其 flags 定义，共享
@@ -64,6 +68,7 @@ _FIXED_REC_KEYS = {
     "reward_values", "execution_steps", "planned_cruise_fraction",
     "fixed_time_speed_violation", "max_planned_qvel", "vla_wall_s",
     "dqn_wall_s", "env_rpc_wall_s", "observation_rpc_wall_s",
+    "input_chunk_steps", "requested_execution_steps",
 }
 
 
@@ -116,6 +121,7 @@ def _save_compare_summary(out_dir, ra, rb):
     """写 compare_summary.json + 打印加速比（dense_steps 为硬可比基准）。"""
     na, nb = ra["exec_backend"], rb["exec_backend"]
     keep = ("success", "success_rate", "reward_success", "reward_success_rate",
+            "mean_decision_steps", "mean_decision_steps_success",
             "mean_dense_steps", "mean_dense_steps_success", "mean_sim_time_s",
             "mean_end_to_end_wall_s", "mean_vla_wall_s", "mean_dqn_wall_s",
             "mean_env_rpc_wall_s", "fixed_time_speed_violation_rate", "fallback_rate",
@@ -149,6 +155,65 @@ def _save_compare_summary(out_dir, ra, rb):
                      "更快 ✓" if sp_median > 1.0 else "更慢/持平")
     else:
         logging.info("严格配对加速比无法计算（没有共同成功 episode）")
+    decision_median = paired["decision_step_ratio"]["median"]
+    if decision_median is not None:
+        logging.info("共同成功 episode decision 数比 (%s/%s, median)=%.2f",
+                     na, nb, decision_median)
+
+
+def _run_paired_video_replay(
+    env_a, env_b, vla, dqn_a, dqn_b, ra, rb, *,
+    backend_a, backend_b, max_decision_steps, seed, out_a, out_b, limit,
+    k_skip_a, k_skip_b, out_dir,
+):
+    selected = select_diagnostic_episode_ids(
+        ra["episodes"], rb["episodes"], limit=limit
+    )
+    if not selected:
+        return []
+    logging.info("Paired diagnostic video replay episode ids: %s", selected)
+    replay_a = ev.run_backend_episodes(
+        env_a, vla, dqn_a["backend"], dqn_a["learner"], backend_a,
+        n_episodes=max(selected) + 1, max_decision_steps=max_decision_steps,
+        seed=seed, out_dir=out_a, record_video=True,
+        video_episode_ids=set(selected), save_episode_artifacts=False,
+        k_skip=k_skip_a,
+    )
+    replay_b = ev.run_backend_episodes(
+        env_b, vla, dqn_b["backend"], dqn_b["learner"], backend_b,
+        n_episodes=max(selected) + 1, max_decision_steps=max_decision_steps,
+        seed=seed, out_dir=out_b, record_video=True,
+        video_episode_ids=set(selected), save_episode_artifacts=False,
+        k_skip=k_skip_b,
+    )
+    primary_a = {int(item["ep"]): item for item in ra["episodes"]}
+    primary_b = {int(item["ep"]): item for item in rb["episodes"]}
+    repeated_a = {int(item["ep"]): item for item in replay_a["episodes"]}
+    repeated_b = {int(item["ep"]): item for item in replay_b["episodes"]}
+    manifest = []
+    for episode in selected:
+        a_tag = "SUCCESS" if repeated_a[episode]["task_success"] else "FAIL"
+        b_tag = "SUCCESS" if repeated_b[episode]["task_success"] else "FAIL"
+        manifest.append({
+            "episode": episode,
+            "seed": primary_a[episode]["seed"],
+            "reason": diagnostic_episode_reason(primary_a, primary_b, episode),
+            backend_a: {
+                "primary_task_success": primary_a[episode]["task_success"],
+                "primary_reward_success": primary_a[episode]["reward_success"],
+                "replay_task_success": repeated_a[episode]["task_success"],
+                "video": os.path.join(backend_a, "videos", f"episode{episode}_{a_tag}.mp4"),
+            },
+            backend_b: {
+                "primary_task_success": primary_b[episode]["task_success"],
+                "primary_reward_success": primary_b[episode]["reward_success"],
+                "replay_task_success": repeated_b[episode]["task_success"],
+                "video": os.path.join(backend_b, "videos", f"episode{episode}_{b_tag}.mp4"),
+            },
+        })
+    with open(os.path.join(out_dir, "video_manifest.json"), "w") as file:
+        json.dump({"selected_episode_ids": selected, "episodes": manifest}, file, indent=2)
+    return manifest
 
 
 def _plot_compare(out_dir, ra, rb):
@@ -268,18 +333,28 @@ def main(_):
     ra = ev.run_backend_episodes(
         env_a, vla, dqn_a["backend"], dqn_a["learner"], FLAGS.backend_a,
         n_episodes=FLAGS.n_episodes, max_decision_steps=FLAGS.max_decision_steps,
-        seed=FLAGS.seed, out_dir=out_a, record_video=FLAGS.record_video,
+        seed=FLAGS.seed, out_dir=out_a, record_video=False,
         k_skip=ev.backend_k_skip(config, FLAGS.backend_a))
 
     logging.info("==== 跑 backend B = %s（被测）====", FLAGS.backend_b)
     rb = ev.run_backend_episodes(
         env_b, vla, dqn_b["backend"], dqn_b["learner"], FLAGS.backend_b,
         n_episodes=FLAGS.n_episodes, max_decision_steps=FLAGS.max_decision_steps,
-        seed=FLAGS.seed, out_dir=out_b, record_video=FLAGS.record_video,
+        seed=FLAGS.seed, out_dir=out_b, record_video=False,
         k_skip=ev.backend_k_skip(config, FLAGS.backend_b))
 
     _save_compare_summary(out_dir, ra, rb)
     _plot_compare(out_dir, ra, rb)
+    if FLAGS.record_video and FLAGS.video_episodes > 0:
+        _run_paired_video_replay(
+            env_a, env_b, vla, dqn_a, dqn_b, ra, rb,
+            backend_a=FLAGS.backend_a, backend_b=FLAGS.backend_b,
+            max_decision_steps=FLAGS.max_decision_steps, seed=FLAGS.seed,
+            out_a=out_a, out_b=out_b, limit=FLAGS.video_episodes,
+            k_skip_a=ev.backend_k_skip(config, FLAGS.backend_a),
+            k_skip_b=ev.backend_k_skip(config, FLAGS.backend_b),
+            out_dir=out_dir,
+        )
     logging.info("对比输出: %s（compare_summary.json + compare_speedup.png + compare_knob.png；"
                  "各 backend 子目录含 videos/ + episode*_speed.{json,png}）", out_dir)
 
