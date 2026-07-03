@@ -89,7 +89,22 @@ class BranchingRainbowQ(nn.Module):
 
 def greedy_action_idxs(dists: Sequence[jnp.ndarray], support: jnp.ndarray) -> jnp.ndarray:
     """每 head 各自按期望 Q argmax → 档位索引 ``[B, n_heads]``。"""
-    idxs = [jnp.argmax(expected_q(d, support), axis=-1) for d in dists]  # each [B]
+    full_limits = tuple(int(dist.shape[-2]) - 1 for dist in dists)
+    return masked_expected_q_argmax(dists, support, full_limits)
+
+
+def masked_expected_q_argmax(
+    dists: Sequence[jnp.ndarray],
+    support: jnp.ndarray,
+    max_action_idxs,
+) -> jnp.ndarray:
+    """Argmax expected Q while excluding actions above each head's limit."""
+    idxs = []
+    for head, dist in enumerate(dists):
+        q_values = expected_q(dist, support)
+        allowed = jnp.arange(dist.shape[-2]) <= jnp.asarray(max_action_idxs[head])
+        q_values = jnp.where(allowed, q_values, -jnp.inf)
+        idxs.append(jnp.argmax(q_values, axis=-1))
     return jnp.stack(idxs, axis=-1)
 
 

@@ -38,6 +38,11 @@ from expo_ft.utils.train_utils import init_logging, init_wandb
 from expo_ft.agents.alg.speedtune_dqn import SpeedTuneLearner
 from expo_ft.data.speedtune_buffer import SpeedTuneReplayBuffer
 from expo_ft.speedtune.exec_backends import build_backend, parse_force_limit
+from expo_ft.speedtune.curriculum import (
+    action_limits_for_backend,
+    build_speed_curriculum,
+    curriculum_metrics,
+)
 from expo_ft.speedtune.runtime_config import (
     backend_k_skip,
     backend_support,
@@ -231,6 +236,8 @@ def main(_):
     H, A = setup["H"], setup["A"]
     exec_backend = str(config.exec_backend)
     checkpoint_metadata = build_checkpoint_metadata(config, backend)
+    curriculum = build_speed_curriculum(config, backend)
+    episode_action_limits = action_limits_for_backend(curriculum, backend)
 
     batch_size = int(config.batch_size)
     utd_ratio = int(config.utd_ratio)                    # P: 每次 update 调用的梯度步数
@@ -259,6 +266,9 @@ def main(_):
             "decision_steps": _step[0],
             "completed_episodes": _episode[0],
             "gradient_updates": _n_updates[0],
+            "curriculum_state": (
+                curriculum.state_dict() if curriculum is not None else None
+            ),
         }
 
     def _publish(lr):
@@ -279,10 +289,11 @@ def main(_):
         learner_lr = learner
         try:
             while True:
-                episode_step = _episode_updates.get()
-                if episode_step is _update_sentinel:
+                update_token = _episode_updates.get()
+                if update_token is _update_sentinel:
                     _episode_updates.task_done()
                     break
+                episode_step, episode_action_limits = update_token
                 beta = _beta_at(episode_step, config)
 
                 class _LockedBuffer:
@@ -297,6 +308,7 @@ def main(_):
                 learner_lr, agg, count = run_episode_updates(
                     learner_lr, _LockedBuffer(), batch_size=batch_size, beta=beta,
                     update_groups=update_per_episode, utd_ratio=utd_ratio,
+                    max_action_idxs=episode_action_limits,
                     on_group_end=_publish,
                 )
                 _n_updates[0] += count
@@ -350,6 +362,12 @@ def main(_):
         ep_lens.append(summary["length"])
         ep_exec_time.append(summary["exec_time_s"])
         ep_dense.append(summary["dense_steps"])
+        if not force_terminal:
+            if curriculum is not None:
+                curriculum.record_episode(
+                    summary["reward_success"], episode=_episode[0] + 1,
+                    decision=_step[0],
+                )
         pending = []
         ep_success = False
         ep_speed_violation = False
@@ -368,8 +386,12 @@ def main(_):
             feat = np.asarray(value_feat[0])                         # DQN state
             real_chunk = unnormalize(mean, obs_m)                    # [H, n_real]
 
-            idxs, actor_lr = actor_lr.sample_action_idxs(feat[None])
+            idxs, actor_lr = actor_lr.sample_action_idxs(
+                feat[None], max_action_idxs=episode_action_limits
+            )
             idxs = np.asarray(idxs[0], dtype=np.int32)
+            if curriculum is not None:
+                curriculum.record_action(idxs)
             speed_params, v_list = backend.decode(idxs)
 
             _executed, exec_info = env.step_chunk(real_chunk, speed_params, exec_backend)
@@ -406,6 +428,7 @@ def main(_):
 
             obs = env.reset() if done else env.get_observation()
             if done:
+                completed_action_limits = episode_action_limits
                 _flush_episode()
                 _episode[0] += 1
                 # 与 train_pi_robo 对齐：至少 10 个完整 episode 且 replay 足够一个 batch。
@@ -415,10 +438,10 @@ def main(_):
                         batch_size=batch_size, warmup_episodes=warmup_episodes,
                     )
                 if ready:
-                    _episode_updates.put(_step[0])
+                    _episode_updates.put((_step[0], completed_action_limits))
                 if ep_returns:
                     fb_rate = _fallbacks[0] / max(_fallbacks[1], 1)
-                    wandb.log({"rollout/success_rate": float(np.mean(ep_returns[-50:])),
+                    rollout_log = {"rollout/success_rate": float(np.mean(ep_returns[-50:])),
                                "rollout/reward_success_rate": float(np.mean(ep_reward_returns[-50:])),
                                "rollout/ep_len_mean": float(np.mean(ep_lens[-50:])),
                                "rollout/exec_time_s": float(np.mean(ep_exec_time[-50:])),  # 对比核心：成功 vs 执行时间
@@ -426,8 +449,10 @@ def main(_):
                                "rollout/fallback_rate": float(fb_rate),
                                "rollout/epsilon": _epsilon_at(it, config),
                                "rollout/buffer_size": len(buffer),
-                               "episode": _episode[0]},      # rollout 横轴 = episode
-                              step=it)
+                               "episode": _episode[0]}
+                    rollout_log.update(curriculum_metrics(curriculum))
+                    wandb.log(rollout_log, step=it)
+                episode_action_limits = action_limits_for_backend(curriculum, backend)
     finally:
         _flush_episode(force_terminal=True)
         # sentinel 排在所有 episode token 后面；worker 先完整消费每个 episode 的 6×UTD 更新。

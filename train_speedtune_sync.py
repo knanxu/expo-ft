@@ -19,6 +19,11 @@ from absl import app
 import openpi.training.sharding as openpi_sharding
 from expo_ft.env.env_client import EnvClientWrapper
 from expo_ft.speedtune.exec_backends import parse_force_limit
+from expo_ft.speedtune.curriculum import (
+    action_limits_for_backend,
+    build_speed_curriculum,
+    curriculum_metrics,
+)
 from expo_ft.speedtune.runtime_config import backend_k_skip
 from expo_ft.speedtune.training_runtime import (
     flush_pending_episode,
@@ -104,6 +109,8 @@ def main(_):
     h, action_dim = setup["H"], setup["A"]
     exec_backend = str(config.exec_backend)
     checkpoint_metadata = build_checkpoint_metadata(config, backend)
+    curriculum = build_speed_curriculum(config, backend)
+    episode_action_limits = action_limits_for_backend(curriculum, backend)
 
     batch_size = int(config.batch_size)
     utd_ratio = int(config.utd_ratio)
@@ -134,6 +141,9 @@ def main(_):
             "completed_episodes": completed_episodes,
             "update_groups": n_update_groups,
             "gradient_updates": n_updates,
+            "curriculum_state": (
+                curriculum.state_dict() if curriculum is not None else None
+            ),
         }
 
     def flush_episode(*, force_terminal=False):
@@ -153,6 +163,12 @@ def main(_):
         ep_lens.append(summary["length"])
         ep_exec_time.append(summary["exec_time_s"])
         ep_dense.append(summary["dense_steps"])
+        if not force_terminal:
+            if curriculum is not None:
+                curriculum.record_episode(
+                    summary["reward_success"], episode=completed_episodes + 1,
+                    decision=decision_steps,
+                )
         pending = []
         ep_success = False
         ep_speed_violation = False
@@ -172,8 +188,12 @@ def main(_):
             feat = np.asarray(value_feat[0])
             real_chunk = unnormalize(mean, obs_m)
 
-            idxs, learner = learner.sample_action_idxs(feat[None])
+            idxs, learner = learner.sample_action_idxs(
+                feat[None], max_action_idxs=episode_action_limits
+            )
             idxs = np.asarray(idxs[0], dtype=np.int32)
+            if curriculum is not None:
+                curriculum.record_action(idxs)
             speed_params, reward_values = backend.decode(idxs)
 
             _executed, exec_info = env.step_chunk(
@@ -235,6 +255,7 @@ def main(_):
 
             flush_episode()
             completed_episodes += 1
+            update_action_limits = episode_action_limits
             if update_ready(
                 completed_episodes=completed_episodes,
                 replay_size=len(buffer),
@@ -249,6 +270,7 @@ def main(_):
                     beta=beta,
                     update_groups=update_per_episode,
                     utd_ratio=utd_ratio,
+                    max_action_idxs=update_action_limits,
                 )
                 n_updates += count
                 n_update_groups += update_per_episode
@@ -274,8 +296,7 @@ def main(_):
                     )
 
             fallback_rate = fallbacks[0] / max(fallbacks[1], 1)
-            wandb.log(
-                {
+            rollout_log = {
                     "rollout/success_rate": float(np.mean(ep_returns[-50:])),
                     "rollout/reward_success_rate": float(
                         np.mean(ep_reward_returns[-50:])
@@ -288,9 +309,10 @@ def main(_):
                     "rollout/buffer_size": len(buffer),
                     "rollout/n_updates": n_updates,
                     "episode": completed_episodes,
-                },
-                step=it,
-            )
+                }
+            rollout_log.update(curriculum_metrics(curriculum))
+            wandb.log(rollout_log, step=it)
+            episode_action_limits = action_limits_for_backend(curriculum, backend)
     finally:
         # A 40,000-decision stop may occur mid-episode. Flush n-step state but do
         # not claim task success or trigger an episode update for this truncation.

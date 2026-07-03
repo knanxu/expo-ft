@@ -27,7 +27,7 @@ from expo_ft.networks.rainbow_dqn import (
     BranchingRainbowQ,
     categorical_projection,
     expected_q,
-    greedy_action_idxs,
+    masked_expected_q_argmax,
     make_support,
 )
 
@@ -43,6 +43,7 @@ def _speedtune_update_step(
     v_min: float,
     v_max: float,
     n_heads: int,
+    max_action_idxs: jnp.ndarray,
 ):
     feat, next_feat = batch["feat"], batch["next_feat"]
     actions = batch["action_idxs"]          # [B, n_heads]
@@ -56,7 +57,10 @@ def _speedtune_update_step(
     next_target = q_apply_fn({"params": target_params}, next_feat)
     m_list = []
     for i in range(n_heads):
-        next_a = jnp.argmax(expected_q(next_online[i], support), axis=-1)  # [B] online 选动作
+        next_q = expected_q(next_online[i], support)
+        allowed = jnp.arange(next_q.shape[-1]) <= max_action_idxs[i]
+        next_q = jnp.where(allowed, next_q, -jnp.inf)
+        next_a = jnp.argmax(next_q, axis=-1)  # [B] online 选动作
         next_dist = next_target[i][bidx, next_a]                          # [B, atoms] target 取分布
         m_i = categorical_projection(next_dist, reward, discount, support, v_min, v_max)
         m_list.append(jax.lax.stop_gradient(m_i))
@@ -136,41 +140,60 @@ class SpeedTuneLearner(struct.PyTreeNode):
             n_heads=len(head_sizes), tau=tau, epsilon=epsilon,
         )
 
-    def greedy_action_idxs(self, feat: jnp.ndarray) -> jnp.ndarray:
-        """纯贪心选档 ``[B, n_heads]``（eval / 确定性推理用）。"""
-        dists = self.q_net.apply_fn({"params": self.q_net.params}, feat)
-        return greedy_action_idxs(dists, self.support)
+    def _action_limits(self, max_action_idxs=None):
+        limits = (
+            tuple(size - 1 for size in self.head_sizes)
+            if max_action_idxs is None
+            else tuple(int(value) for value in max_action_idxs)
+        )
+        if len(limits) != self.n_heads:
+            raise ValueError(f"expected {self.n_heads} action limits, got {limits}")
+        for limit, size in zip(limits, self.head_sizes):
+            if not 0 <= limit < size:
+                raise ValueError(f"action limit {limit} outside [0, {size})")
+        return limits
 
-    def sample_action_idxs(self, feat: jnp.ndarray, *, greedy: bool = False
+    def greedy_action_idxs(self, feat: jnp.ndarray, *, max_action_idxs=None) -> jnp.ndarray:
+        """纯贪心选档 ``[B, n_heads]``（eval / 确定性推理用）。"""
+        limits = self._action_limits(max_action_idxs)
+        dists = self.q_net.apply_fn({"params": self.q_net.params}, feat)
+        return masked_expected_q_argmax(dists, self.support, limits)
+
+    def sample_action_idxs(self, feat: jnp.ndarray, *, greedy: bool = False,
+                           max_action_idxs=None
                            ) -> Tuple[jnp.ndarray, "SpeedTuneLearner"]:
         """rollout 选档：每 head 独立 epsilon-greedy。返回 ``([B, n_heads], new_self)``。"""
-        greedy_idxs = self.greedy_action_idxs(feat)  # [B, n_heads]
+        limits = self._action_limits(max_action_idxs)
+        greedy_idxs = self.greedy_action_idxs(
+            feat, max_action_idxs=limits
+        )  # [B, n_heads]
         if greedy or self.epsilon <= 0.0:
             return greedy_idxs, self
         B = feat.shape[0]
         rng = self.rng
         out = []
-        for i in range(self.n_heads):
+        for i, limit in enumerate(limits):
             rng, rk1, rk2 = jax.random.split(rng, 3)
-            rand_a = jax.random.randint(rk1, (B,), 0, self.head_sizes[i])
+            rand_a = jax.random.randint(rk1, (B,), 0, limit + 1)
             explore = jax.random.uniform(rk2, (B,)) < self.epsilon
             out.append(jnp.where(explore, rand_a, greedy_idxs[:, i]))
         idxs = jnp.stack(out, axis=-1)
         return idxs, self.replace(rng=rng)
 
-    def update(self, batch: Dict[str, Any]
+    def update(self, batch: Dict[str, Any], *, max_action_idxs=None
                ) -> Tuple["SpeedTuneLearner", jnp.ndarray, Dict[str, jnp.ndarray]]:
         """一次 DQN 梯度步 + target 软更新。
 
         ``batch`` 含 ``feat/next_feat/action_idxs/reward/discount/is_weights``（numpy 或 jnp）。
         Returns ``(new_self, td_priorities[B], metrics)``；``td_priorities`` 回写 PER sum-tree。
         """
+        limits = self._action_limits(max_action_idxs)
         jbatch = {k: jnp.asarray(v) for k, v in batch.items()
                   if k in ("feat", "next_feat", "action_idxs", "reward", "discount", "is_weights")}
         q_net, per_sample, metrics = _speedtune_update_step(
             self.q_net, self.target_params, jbatch, self.support,
             q_apply_fn=self.q_net.apply_fn, v_min=self.v_min, v_max=self.v_max,
-            n_heads=self.n_heads,
+            n_heads=self.n_heads, max_action_idxs=jnp.asarray(limits, dtype=jnp.int32),
         )
         new_target = optax.incremental_update(q_net.params, self.target_params, self.tau)
         new_self = self.replace(q_net=q_net, target_params=new_target)

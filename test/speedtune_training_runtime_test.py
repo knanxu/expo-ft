@@ -12,9 +12,11 @@ from expo_ft.speedtune.training_runtime import (
 class FakeLearner:
     def __init__(self):
         self.update_calls = 0
+        self.action_limits = []
 
-    def update(self, batch):
+    def update(self, batch, *, max_action_idxs=None):
         self.update_calls += 1
+        self.action_limits.append(max_action_idxs)
         td = np.ones(len(batch["tree_indices"]), dtype=np.float32)
         return self, td, {"loss": float(self.update_calls)}
 
@@ -66,6 +68,7 @@ def test_one_episode_runs_six_groups_of_twenty_gradient_updates():
         beta=0.4,
         update_groups=6,
         utd_ratio=20,
+        max_action_idxs=(2,),
         on_group_end=lambda current: published.append(current.update_calls),
     )
 
@@ -74,6 +77,7 @@ def test_one_episode_runs_six_groups_of_twenty_gradient_updates():
     assert buffer.sample_calls == 120
     assert buffer.priority_calls == 120
     assert published == [20, 40, 60, 80, 100, 120]
+    assert learner.action_limits == [(2,)] * 120
     assert metrics["loss"] == 60.5
 
 
@@ -133,7 +137,7 @@ def test_sync_entry_uses_environment_decision_budget_and_partial_flush():
 def test_async_entry_uses_counted_episode_queue_instead_of_event_latch():
     source = (Path(__file__).parents[1] / "train_speedtune_async.py").read_text()
     assert "_episode_updates = queue.Queue()" in source
-    assert "_episode_updates.put(_step[0])" in source
+    assert "_episode_updates.put((_step[0], completed_action_limits))" in source
     assert "_episode_updates.put(_update_sentinel)" in source
     assert "_new_episode = threading.Event()" not in source
     assert "_worker_error = [None]" in source

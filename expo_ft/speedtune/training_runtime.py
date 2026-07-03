@@ -31,6 +31,7 @@ def run_episode_updates(
     beta: float,
     update_groups: int,
     utd_ratio: int,
+    max_action_idxs=None,
     on_group_end: Optional[Callable] = None,
 ):
     """Run the exact per-episode update schedule and aggregate scalar metrics."""
@@ -39,7 +40,9 @@ def run_episode_updates(
     for _ in range(int(update_groups)):
         for _ in range(int(utd_ratio)):
             batch = buffer.sample(int(batch_size), beta=float(beta))
-            learner, td, metrics = learner.update(batch)
+            learner, td, metrics = learner.update(
+                batch, max_action_idxs=max_action_idxs
+            )
             buffer.update_priorities(batch["tree_indices"], np.asarray(td))
             metrics_history.append(metrics)
             n_updates += 1

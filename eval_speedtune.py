@@ -54,6 +54,7 @@ from expo_ft.speedtune.paired_eval import (
 )
 from expo_ft.speedtune.checkpoint_contract import (
     build_checkpoint_metadata,
+    curriculum_action_limits,
     validate_checkpoint_metadata,
     WHOLE_CHUNK_ACC_RULE,
 )
@@ -140,7 +141,8 @@ def _build_dqn(config, seed, exec_backend, dqn_ckpt, feat_dim, vfeat0):
                  backend.name, backend.head_sizes, dqn_ckpt)
 
     expected_metadata = build_checkpoint_metadata(config, backend)
-    validate_checkpoint_metadata(dqn_ckpt, expected_metadata)
+    actual_metadata = validate_checkpoint_metadata(dqn_ckpt, expected_metadata)
+    action_limits = curriculum_action_limits(actual_metadata, backend.head_sizes)
     v_min, v_max = backend_support(config, str(exec_backend))
     dqn = SpeedTuneLearner.create(
         rng=jax.random.PRNGKey(seed), feat_dim=feat_dim, head_sizes=backend.head_sizes,
@@ -151,8 +153,10 @@ def _build_dqn(config, seed, exec_backend, dqn_ckpt, feat_dim, vfeat0):
     )
     dqn = _restore_dqn(dqn, dqn_ckpt)
     # Exclude one-time JAX compilation from deployment wall-time metrics.
-    np.asarray(dqn.greedy_action_idxs(jnp.asarray(vfeat0)))
-    return dict(backend=backend, learner=dqn)
+    np.asarray(dqn.greedy_action_idxs(
+        jnp.asarray(vfeat0), max_action_idxs=action_limits
+    ))
+    return dict(backend=backend, learner=dqn, max_action_idxs=action_limits)
 
 
 def _restore_dqn(learner, ckpt_dir):
@@ -238,7 +242,7 @@ def _save_and_plot(out_dir, ep, recs, ep_success=None):
 def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
                          n_episodes, max_decision_steps, seed, out_dir, record_video,
                          k_skip=None, video_episode_ids=None,
-                         save_episode_artifacts=True):
+                         save_episode_artifacts=True, max_action_idxs=None):
     """跑 n_episodes（录视频 + 逐 chunk 记录 + 每 episode _save_and_plot），返回聚合 result dict。
 
     Args:
@@ -289,7 +293,9 @@ def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
             vla_wall += vla_step_wall
 
             stage_start = time.perf_counter()
-            idxs = np.asarray(learner.greedy_action_idxs(feat[None])[0], dtype=np.int32)  # greedy 无探索
+            idxs = np.asarray(learner.greedy_action_idxs(
+                feat[None], max_action_idxs=max_action_idxs
+            )[0], dtype=np.int32)  # greedy 无探索
             speed_params, reward_values = backend.decode(idxs)
             aggr_values = [
                 var.aggressiveness(int(idx)) for var, idx in zip(backend.vars, idxs)
@@ -408,6 +414,11 @@ def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
             float(np.mean([e["fallback_count"] > 0 for e in episodes])) if episodes else 0.0
         ),
         k_skip=k_skip,
+        max_action_idxs=(list(max_action_idxs) if max_action_idxs is not None else None),
+        max_unlocked_speed=(
+            backend.vars[0].value(max_action_idxs[0])
+            if max_action_idxs is not None and backend.n_heads == 1 else None
+        ),
         acc_rule=(WHOLE_CHUNK_ACC_RULE if exec_backend == "chunk_toppra" else None),
         speed_action_counts=action_counts,
         mean_decision_steps=(float(np.mean([e["n_decision_steps"] for e in episodes]))
@@ -450,7 +461,7 @@ def _run_single_video_replay(
         n_episodes=max(selected) + 1, max_decision_steps=max_decision_steps,
         seed=seed, out_dir=out_dir, record_video=True,
         video_episode_ids=set(selected), save_episode_artifacts=False,
-        k_skip=k_skip,
+        k_skip=k_skip, max_action_idxs=dqnpack["max_action_idxs"],
     )
     primary = {int(item["ep"]): item for item in primary_result["episodes"]}
     replay_by_id = {int(item["ep"]): item for item in replay["episodes"]}
@@ -515,6 +526,7 @@ def main(_):
         n_episodes=FLAGS.n_episodes, max_decision_steps=FLAGS.max_decision_steps,
         seed=FLAGS.seed, out_dir=out_dir, record_video=False,
         k_skip=backend_k_skip(config, exec_backend),
+        max_action_idxs=dqnpack["max_action_idxs"],
     )
 
     # ---- 汇总写盘（保持原 eval_summary.json 字段，新增加速指标 mean_dense_steps）----
@@ -533,6 +545,8 @@ def main(_):
         "fixed_time_speed_violation_rate": result["fixed_time_speed_violation_rate"],
         "fallback_rate": result["fallback_rate"],
         "k_skip": result["k_skip"], "acc_rule": result["acc_rule"],
+        "max_action_idxs": result["max_action_idxs"],
+        "max_unlocked_speed": result["max_unlocked_speed"],
         "speed_action_counts": result["speed_action_counts"],
         "mean_decision_steps": result["mean_decision_steps"],
         "mean_decision_steps_success": result["mean_decision_steps_success"],

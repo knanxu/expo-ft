@@ -7,7 +7,11 @@ from expo_ft.speedtune.exec_backends import build_backend
 
 
 class FakeLearner:
-    def greedy_action_idxs(self, feat):
+    def __init__(self):
+        self.action_limits = []
+
+    def greedy_action_idxs(self, feat, *, max_action_idxs=None):
+        self.action_limits.append(max_action_idxs)
         return np.asarray([[0]], dtype=np.int32)
 
 
@@ -58,10 +62,11 @@ def test_eval_records_physics_wall_and_safe_success(monkeypatch=None):
         }
         env = FakeEnv()
         with tempfile.TemporaryDirectory() as tmp:
+            learner = FakeLearner()
             result = ev.run_backend_episodes(
-                env, vla, build_backend("fixed_time"), FakeLearner(), "fixed_time",
+                env, vla, build_backend("fixed_time"), learner, "fixed_time",
                 n_episodes=1, max_decision_steps=3, seed=42, out_dir=tmp,
-                record_video=False, k_skip=10,
+                record_video=False, k_skip=10, max_action_idxs=(0,),
             )
         episode = result["episodes"][0]
         assert env.reseed_value == 42
@@ -73,6 +78,7 @@ def test_eval_records_physics_wall_and_safe_success(monkeypatch=None):
         assert episode["end_to_end_wall_s"] >= episode["vla_wall_s"]
         assert result["fixed_time_speed_violation_rate"] == 1.0
         assert result["speed_action_counts"] == {"v": {"1.0": 1}}
+        assert learner.action_limits == [(0,)]
     finally:
         ev._save_and_plot = original
 
@@ -97,7 +103,7 @@ def test_eval_records_only_selected_video_ids_without_overwriting_artifacts():
                 env, vla, build_backend("fixed_time"), FakeLearner(), "fixed_time",
                 n_episodes=3, max_decision_steps=3, seed=42, out_dir=tmp,
                 record_video=True, video_episode_ids={1}, save_episode_artifacts=False,
-                k_skip=10,
+                k_skip=10, max_action_idxs=(0,),
             )
         assert env.started_videos == [1]
         assert env.stopped_videos == 1

@@ -77,6 +77,11 @@ def get_config():
     config.epsilon_end = 0.05
     config.epsilon_decay_steps = 20000   # 决策步数
 
+    # --- 单速度head课程（fixed_time / chunk_toppra）---
+    config.curriculum_enabled = True
+    config.curriculum_window_size = 20
+    config.curriculum_success_threshold = 0.7
+
     # --- replay / 训练循环 ---
     config.buffer_capacity = 100000
     config.batch_size = 64

@@ -125,7 +125,8 @@ def _save_compare_summary(out_dir, ra, rb):
             "mean_dense_steps", "mean_dense_steps_success", "mean_sim_time_s",
             "mean_end_to_end_wall_s", "mean_vla_wall_s", "mean_dqn_wall_s",
             "mean_env_rpc_wall_s", "fixed_time_speed_violation_rate", "fallback_rate",
-            "k_skip", "acc_rule", "speed_action_counts",
+            "k_skip", "acc_rule", "max_action_idxs", "max_unlocked_speed",
+            "speed_action_counts",
             "aggr_in_contact_mean", "aggr_free_mean")
     paired = paired_metrics(ra["episodes"], rb["episodes"])
     paired_safe = paired_metrics(
@@ -177,14 +178,14 @@ def _run_paired_video_replay(
         n_episodes=max(selected) + 1, max_decision_steps=max_decision_steps,
         seed=seed, out_dir=out_a, record_video=True,
         video_episode_ids=set(selected), save_episode_artifacts=False,
-        k_skip=k_skip_a,
+        k_skip=k_skip_a, max_action_idxs=dqn_a["max_action_idxs"],
     )
     replay_b = ev.run_backend_episodes(
         env_b, vla, dqn_b["backend"], dqn_b["learner"], backend_b,
         n_episodes=max(selected) + 1, max_decision_steps=max_decision_steps,
         seed=seed, out_dir=out_b, record_video=True,
         video_episode_ids=set(selected), save_episode_artifacts=False,
-        k_skip=k_skip_b,
+        k_skip=k_skip_b, max_action_idxs=dqn_b["max_action_idxs"],
     )
     primary_a = {int(item["ep"]): item for item in ra["episodes"]}
     primary_b = {int(item["ep"]): item for item in rb["episodes"]}
@@ -334,14 +335,16 @@ def main(_):
         env_a, vla, dqn_a["backend"], dqn_a["learner"], FLAGS.backend_a,
         n_episodes=FLAGS.n_episodes, max_decision_steps=FLAGS.max_decision_steps,
         seed=FLAGS.seed, out_dir=out_a, record_video=False,
-        k_skip=ev.backend_k_skip(config, FLAGS.backend_a))
+        k_skip=ev.backend_k_skip(config, FLAGS.backend_a),
+        max_action_idxs=dqn_a["max_action_idxs"])
 
     logging.info("==== 跑 backend B = %s（被测）====", FLAGS.backend_b)
     rb = ev.run_backend_episodes(
         env_b, vla, dqn_b["backend"], dqn_b["learner"], FLAGS.backend_b,
         n_episodes=FLAGS.n_episodes, max_decision_steps=FLAGS.max_decision_steps,
         seed=FLAGS.seed, out_dir=out_b, record_video=False,
-        k_skip=ev.backend_k_skip(config, FLAGS.backend_b))
+        k_skip=ev.backend_k_skip(config, FLAGS.backend_b),
+        max_action_idxs=dqn_b["max_action_idxs"])
 
     _save_compare_summary(out_dir, ra, rb)
     _plot_compare(out_dir, ra, rb)
