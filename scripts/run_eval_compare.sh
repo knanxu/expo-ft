@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # SpeedTune 双 backend 加速对比 eval：起两个 RoboTwin env server(不同 backend/port) + 一个 compare
-# 进程(3B 冻结 VLA + 两个训练好的 DQN，各连一个 server)，对比 per_action_toppra vs fixed_time 的执行速度。
+# 进程(3B 冻结 VLA + 两个训练好的 DQN，各连一个 server)，对比 chunk_toppra vs fixed_time。
 #
 # 卡分配（3 卡；光追 sapien server 各独占一卡，与 compare 分卡避免抢显存）：
 #   server A(BACKEND_A)→GPU0(port PORT_A) | server B(BACKEND_B)→GPU1(port PORT_B) | compare→GPU2
 #
 # 用法（云端；VLA 三路径已默认指向云端 drift ckpt，通常只需给两个 DQN checkpoint）：
 #   CKPT_A=logs/.../fixed_time/checkpoints/update_<N> \
-#   CKPT_B=logs/.../per_action_toppra/checkpoints/update_<N> \
+#   CKPT_B=logs/.../chunk_toppra/checkpoints/update_<N> \
 #   bash scripts/run_eval_compare.sh
 #   （VLA ckpt 换位置时：export SPEEDTUNE_VLA_ROOT=<根目录(params/ 与 assets/ 平级)> 覆盖，
 #    或单独 export SPEEDTUNE_VLA_CKPT / SPEEDTUNE_VLA_ASSETS / SPEEDTUNE_VLA_ASSET_ID）
@@ -25,7 +25,7 @@ ROBOTWIN_ENV="${ROBOTWIN_ENV:-RoboTwin}"           # RoboTwin sim 的 conda env 
 PYTHON="${PYTHON:-uv run python}"                  # learner 端 python（云端 uv）
 TASK_CONFIG="${TASK_CONFIG:-configs/task/robotwin_stack_blocks.py}"
 MODEL_CONFIG="${MODEL_CONFIG:-configs/model/speedtune_dqn_config.py}"
-N_EPISODES="${N_EPISODES:-5}"
+N_EPISODES="${N_EPISODES:-30}"
 SEED="${SEED:-0}"
 MAX_DECISION_STEPS="${MAX_DECISION_STEPS:-400}"
 # fixed_time(streaming) 每 action hold 的物理步：250/这个=等效控制Hz；务必与训练时一致（默认 15）。
@@ -35,7 +35,7 @@ COMPARE_MEM_FRAC="${COMPARE_MEM_FRAC:-0.85}"       # compare(3B VLA) 单卡显�
 
 # 两 backend + 各自 DQN checkpoint（CKPT_A / CKPT_B 必填）。A=基准, B=被测。
 BACKEND_A="${BACKEND_A:-fixed_time}"
-BACKEND_B="${BACKEND_B:-per_action_toppra}"
+BACKEND_B="${BACKEND_B:-chunk_toppra}"
 PORT_A="${PORT_A:-8103}"
 PORT_B="${PORT_B:-8102}"
 : "${CKPT_A:?请 export CKPT_A=<backend_a 的 DQN checkpoint update_<N> 目录（含 q_net/）>}"
@@ -63,12 +63,19 @@ echo "[*] compare→GPU $COMPARE_GPU | 冻结 VLA: $SPEEDTUNE_VLA_CKPT"
 
 PIDS=()
 cleanup() {
+  local rc="$?" p
+  trap - EXIT INT TERM
   echo ""
   echo "[cleanup] 终止所有子进程 ..."
-  for p in "${PIDS[@]:-}"; do kill -9 "$p" 2>/dev/null || true; done
+  for p in "${PIDS[@]:-}"; do kill -TERM -- "-$p" 2>/dev/null || true; done
+  sleep 1
+  for p in "${PIDS[@]:-}"; do kill -KILL -- "-$p" 2>/dev/null || true; done
   wait 2>/dev/null || true
+  exit "$rc"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 cd "$EXPO_ROOT"
 
@@ -89,7 +96,7 @@ PORTS=("$PORT_A" "$PORT_B")
 for i in 0 1; do
   be="${BACKENDS[$i]}"; port="${PORTS[$i]}"; sgpu="${SERVER_GPUS[$i]}"
   echo "[$be] 启动 env server  server_GPU=$sgpu  port=$port"
-  CUDA_VISIBLE_DEVICES="$sgpu" \
+  setsid env CUDA_VISIBLE_DEVICES="$sgpu" \
   conda run --no-capture-output -n "$ROBOTWIN_ENV" \
     python -m client_robotwin.run_robotwin_client \
       --config_task_path "$TASK_CONFIG" --robotwin_root "$ROBOTWIN_ROOT" --server_port "$port" \

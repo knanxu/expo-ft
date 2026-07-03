@@ -1,10 +1,10 @@
 #! /usr/bin/env python
 """SpeedTune eval：冻结 VLA(base policy) + 训练好的 DQN(速度模块)，在 RoboTwin 跑 N episode。
 
-每个 episode：① 录制 head_camera 视频(server 端 ffmpeg)；② 每个决策步记录速度控制参数
-(v/vel_limit/acc_limit + 归一化激进度) 与接触信号(夹爪值 + sapien 物理接触) + 累计仿真时间；
-③ 存 json + 画「激进度 vs 时间(接触时段阴影)」图。结尾汇总**接触时段 vs 非接触时段的平均激进度**
-——直接回答「是否在接触附近减速、其他时候加速」。
+每个 episode：① 录制 head_camera 视频(server 端 ffmpeg)；② 每个决策步记录后端直接使用的
+原始速度参数（fixed_time 的 v / chunk_toppra 的 vel_limit）、接触信号与累计仿真时间；
+③ 存 json + 画「原始速度参数 vs 时间(接触时段阴影)」图。结尾汇总接触与非接触时段的
+原始速度参数，并记录 fixed_time 的最大规划关节速度。
 
 DQN 用 greedy(无探索)。架构同 train：client-learner 分离(VLA/DQN 在 JAX venv，RoboTwin 在 sim venv)，
 经 client_robotwin 的 step_chunk(回传接触) + start/stop_video(录像) 协议。
@@ -17,7 +17,7 @@ DQN 用 greedy(无探索)。架构同 train：client-learner 分离(VLA/DQN 在 
     uv run python eval_speedtune.py \
         --config configs/model/speedtune_dqn_config.py --config.exec_backend per_action_toppra \
         --config_task configs/task/robotwin_stack_blocks.py \
-        --dqn_ckpt logs/.../checkpoints/update_<N> --n_episodes 5 \
+        --dqn_ckpt logs/.../checkpoints/update_<N> --n_episodes 30 \
         --client_port 8102 --output_dir logs/speedtune_eval
 （server 端起 client_robotwin.run_robotwin_client，与 train 相同。）
 """
@@ -56,7 +56,6 @@ from expo_ft.speedtune.checkpoint_contract import (
     build_checkpoint_metadata,
     curriculum_action_limits,
     validate_checkpoint_metadata,
-    WHOLE_CHUNK_ACC_RULE,
 )
 
 import warnings
@@ -219,21 +218,27 @@ def _save_and_plot(out_dir, ep, recs, ep_success=None):
         return
 
     t = [r["t_sim"] for r in recs]
-    aggr = [r["aggr_mean"] for r in recs]
+    speed_key = "vel_limit" if "vel_limit" in recs[0] else "v"
+    speed = [r[speed_key] for r in recs]
     lg = [r["left_gripper"] for r in recs]
     rg = [r["right_gripper"] for r in recs]
 
     fig, ax = plt.subplots(figsize=(11, 5))
     _overlay_contact_grasp(ax, recs, x_key="t_sim")   # 接触方块阴影 + 抓取竖线
-    ax.plot(t, aggr, "-o", color="tab:blue", label="aggressiveness (0=slow ~ 1=fast)")
-    ax.plot(t, lg, "--", color="tab:green", alpha=0.6, label="left gripper (0=closed ~ 1=open)")
-    ax.plot(t, rg, "--", color="tab:olive", alpha=0.6, label="right gripper")
+    ax.plot(t, speed, "-o", color="tab:blue", label=speed_key)
     ax.set_xlabel("sim time (s)")
-    ax.set_ylabel("aggressiveness / gripper")
-    ax.set_ylim(-0.05, 1.05)
+    ax.set_ylabel(f"{speed_key} (raw)")
+    gripper_ax = ax.twinx()
+    gripper_ax.plot(t, lg, "--", color="tab:green", alpha=0.6,
+                    label="left gripper (0=closed ~ 1=open)")
+    gripper_ax.plot(t, rg, "--", color="tab:olive", alpha=0.6, label="right gripper")
+    gripper_ax.set_ylabel("gripper")
+    gripper_ax.set_ylim(-0.05, 1.05)
     _tag = "" if ep_success is None else (" [SUCCESS]" if ep_success else " [FAILED]")
-    ax.set_title(f"episode {ep}{_tag}: speed knob vs grasp/contact")
-    ax.legend(loc="upper right", fontsize=8)
+    ax.set_title(f"episode {ep}{_tag}: raw speed vs grasp/contact")
+    lines, labels = ax.get_legend_handles_labels()
+    lines2, labels2 = gripper_ax.get_legend_handles_labels()
+    ax.legend(lines + lines2, labels + labels2, loc="upper right", fontsize=8)
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, f"episode{ep}_speed.png"), dpi=120)
     plt.close(fig)
@@ -255,8 +260,8 @@ def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
     Returns:
       result dict：exec_backend / n_episodes / success / success_rate /
         mean_dense_steps / mean_sim_time_s / mean_dense_steps_success /
-        aggr_in_contact_mean / aggr_free_mean / decel_near_contact /
-        n_contact_steps / n_free_steps / episodes(每 episode 的 success/步数/recs)。
+        speed_param_name / speed_in_contact_mean / speed_free_mean /
+        max_planned_qvel / episodes(每 episode 的 success/步数/recs)。
       其中 **dense_steps（物理步数, ÷250=仿真秒）是跨 backend 唯一硬可比的执行时间基准**。
     """
     drift_forward, unnormalize, preprocess = vla["drift_forward"], vla["unnormalize"], vla["preprocess"]
@@ -264,7 +269,10 @@ def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
 
     n_succ = 0
     n_reward_succ = 0
-    all_contact_aggr, all_free_aggr = [], []   # 跨 episode 汇总：接触 vs 非接触时段激进度
+    if backend.n_heads != 1:
+        logging.warning("eval raw-speed contract uses the first variable for multi-head backend %s", backend.name)
+    speed_param_name = backend.vars[0].name
+    all_contact_speed, all_free_speed = [], []
     episodes = []
 
     env.reseed(seed)
@@ -296,10 +304,7 @@ def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
             idxs = np.asarray(learner.greedy_action_idxs(
                 feat[None], max_action_idxs=max_action_idxs
             )[0], dtype=np.int32)  # greedy 无探索
-            speed_params, reward_values = backend.decode(idxs)
-            aggr_values = [
-                var.aggressiveness(int(idx)) for var, idx in zip(backend.vars, idxs)
-            ]
+            speed_params, _reward_values = backend.decode(idxs)
             dqn_step_wall = time.perf_counter() - stage_start
             dqn_wall += dqn_step_wall
 
@@ -315,12 +320,10 @@ def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
             planned_time += float(info.get("duration", 0.0))
 
             lc, rc = bool(info.get("left_contact", False)), bool(info.get("right_contact", False))
-            aggr_mean = float(np.mean(aggr_values)) if aggr_values else 0.0
+            speed_value = float(speed_params[speed_param_name])
             rec = dict(
                 step=step_i, t_sim=round(t_acc, 4),
                 dense_steps=dense_steps,
-                aggr_mean=aggr_mean, aggr=[float(x) for x in aggr_values],
-                reward_values=[float(x) for x in reward_values],
                 left_gripper=float(info.get("left_gripper", 0.0)),
                 right_gripper=float(info.get("right_gripper", 0.0)),
                 left_contact=lc, right_contact=rc,
@@ -334,11 +337,9 @@ def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
                 vla_wall_s=vla_step_wall, dqn_wall_s=dqn_step_wall,
                 env_rpc_wall_s=env_step_wall,
             )
-            rec.update({k: float(v) for k, v in speed_params.items()})  # v / vel_limit / acc_limit
-            if "acc_limit" in info and "acc_limit" not in rec:
-                rec["derived_acc_limit"] = float(info["acc_limit"])
+            rec[speed_param_name] = speed_value
             recs.append(rec)
-            (all_contact_aggr if (lc or rc) else all_free_aggr).append(aggr_mean)
+            (all_contact_speed if (lc or rc) else all_free_speed).append(speed_value)
 
             if done:
                 break
@@ -377,9 +378,9 @@ def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
             task_success=bool(ep_success), reward_success=bool(ep_reward_success),
             fixed_time_speed_violation=bool(ep_speed_violation),
             n_decision_steps=len(recs), k_skip=k_skip,
-            acc_rule=(WHOLE_CHUNK_ACC_RULE if exec_backend == "chunk_toppra" else None),
             fallback_count=int(fallback_count),
             planned_cruise_fraction=cruise_fraction,
+            max_planned_qvel=(max((r["max_planned_qvel"] for r in recs), default=0.0)),
             total_dense_steps=ep_dense, sim_time_s=round(ep_dense / 250.0, 4),
             planned_duration_s=planned_time,
             vla_wall_s=vla_wall, dqn_wall_s=dqn_wall,
@@ -389,18 +390,16 @@ def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
         logging.info("[%s] episode %d: success=%s decision_steps=%d dense_steps=%d sim_time=%.2fs",
                      exec_backend, ep, ep_success, len(recs), ep_dense, t_acc)
 
-    # ---- 汇总：接触 vs 非接触时段的平均激进度 + 加速指标（dense_steps / sim_time）----
-    c_mean = float(np.mean(all_contact_aggr)) if all_contact_aggr else float("nan")
-    f_mean = float(np.mean(all_free_aggr)) if all_free_aggr else float("nan")
+    # ---- 汇总：接触 vs 非接触时段的原始速度参数 + 加速指标 ----
+    c_mean = float(np.mean(all_contact_speed)) if all_contact_speed else None
+    f_mean = float(np.mean(all_free_speed)) if all_free_speed else None
     succ_eps = [e for e in episodes if e["success"]]
-    action_counts = {}
-    for var in backend.vars:
-        counts = {}
-        for episode in episodes:
-            for rec in episode["recs"]:
-                value = str(rec[var.name])
-                counts[value] = counts.get(value, 0) + 1
-        action_counts[var.name] = counts
+    counts = {}
+    for episode in episodes:
+        for rec in episode["recs"]:
+            value = str(rec[speed_param_name])
+            counts[value] = counts.get(value, 0) + 1
+    action_counts = {speed_param_name: counts}
     result = dict(
         exec_backend=exec_backend, n_episodes=n_episodes, success=n_succ,
         reward_success=n_reward_succ,
@@ -419,8 +418,8 @@ def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
             backend.vars[0].value(max_action_idxs[0])
             if max_action_idxs is not None and backend.n_heads == 1 else None
         ),
-        acc_rule=(WHOLE_CHUNK_ACC_RULE if exec_backend == "chunk_toppra" else None),
         speed_action_counts=action_counts,
+        speed_param_name=speed_param_name,
         mean_decision_steps=(float(np.mean([e["n_decision_steps"] for e in episodes]))
                              if episodes else 0.0),
         mean_decision_steps_success=(
@@ -438,9 +437,13 @@ def run_backend_episodes(env, vla, backend, learner, exec_backend, *,
         # 只在成功 episode 上算执行步数（加速对比应在「都成功」的前提下比，避免失败早停拉低步数）
         mean_dense_steps_success=(float(np.mean([e["total_dense_steps"] for e in succ_eps]))
                                   if succ_eps else float("nan")),
-        aggr_in_contact_mean=c_mean, aggr_free_mean=f_mean,
-        decel_near_contact=bool(c_mean < f_mean) if (all_contact_aggr and all_free_aggr) else None,
-        n_contact_steps=len(all_contact_aggr), n_free_steps=len(all_free_aggr),
+        speed_in_contact_mean=c_mean, speed_free_mean=f_mean,
+        slows_near_contact=(bool(c_mean < f_mean) if c_mean is not None and f_mean is not None else None),
+        n_contact_decisions=len(all_contact_speed), n_free_decisions=len(all_free_speed),
+        max_planned_qvel=max((e["max_planned_qvel"] for e in episodes), default=0.0),
+        mean_episode_max_planned_qvel=(
+            float(np.mean([e["max_planned_qvel"] for e in episodes])) if episodes else 0.0
+        ),
         episodes=episodes,
     )
     return result
@@ -544,16 +547,20 @@ def main(_):
         "mean_env_rpc_wall_s": result["mean_env_rpc_wall_s"],
         "fixed_time_speed_violation_rate": result["fixed_time_speed_violation_rate"],
         "fallback_rate": result["fallback_rate"],
-        "k_skip": result["k_skip"], "acc_rule": result["acc_rule"],
+        "k_skip": result["k_skip"],
         "max_action_idxs": result["max_action_idxs"],
         "max_unlocked_speed": result["max_unlocked_speed"],
         "speed_action_counts": result["speed_action_counts"],
+        "speed_param_name": result["speed_param_name"],
         "mean_decision_steps": result["mean_decision_steps"],
         "mean_decision_steps_success": result["mean_decision_steps_success"],
-        "aggr_in_contact_mean": result["aggr_in_contact_mean"],
-        "aggr_free_mean": result["aggr_free_mean"],
-        "decel_near_contact": result["decel_near_contact"],
-        "n_contact_steps": result["n_contact_steps"], "n_free_steps": result["n_free_steps"],
+        "speed_in_contact_mean": result["speed_in_contact_mean"],
+        "speed_free_mean": result["speed_free_mean"],
+        "slows_near_contact": result["slows_near_contact"],
+        "n_contact_decisions": result["n_contact_decisions"],
+        "n_free_decisions": result["n_free_decisions"],
+        "max_planned_qvel": result["max_planned_qvel"],
+        "mean_episode_max_planned_qvel": result["mean_episode_max_planned_qvel"],
     }
     with open(os.path.join(out_dir, "eval_summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
@@ -569,10 +576,9 @@ def main(_):
                  100 * result["success_rate"])
     logging.info("平均执行步数 dense_steps=%.0f (成功 episode=%.0f) | 平均仿真时间=%.2fs",
                  result["mean_dense_steps"], result["mean_dense_steps_success"], result["mean_sim_time_s"])
-    logging.info("接触时段平均激进度 = %.3f | 非接触时段 = %.3f → 接触附近%s",
-                 result["aggr_in_contact_mean"], result["aggr_free_mean"],
-                 "减速 ✓" if result["decel_near_contact"] else
-                 ("未减速" if result["decel_near_contact"] is False else "(数据不足)"))
+    logging.info("原始 %s: 接触均值=%s | 非接触均值=%s | max planned qvel=%.3f rad/s",
+                 result["speed_param_name"], result["speed_in_contact_mean"],
+                 result["speed_free_mean"], result["max_planned_qvel"])
     logging.info("输出目录: %s（videos/ + episode*_speed.{json,png} + eval_summary.json）", out_dir)
 
 

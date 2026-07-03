@@ -2,10 +2,10 @@
 """SpeedTune 双 backend 加速对比 eval：同一冻结 VLA + 两个训练好的 DQN(各自 backend)，
 在 RoboTwin 上各跑 N episode，对比执行速度 + 加速控制参数。
 
-核心用途：测「现在更新执行方式后的 per_action_toppra」vs「fixed_time」的执行速度。
+核心用途：测 whole-chunk TOPPRA vs fixed-time 的执行速度。
   - 加速指标用 **dense_steps（物理步数, ÷250=仿真秒）**——这是跨 backend 唯一硬可比的执行时间基准
-    （fixed_time=M×hold_steps；per_action=Σ各段步数；都 250Hz 仿真）。加速比 = A 步数 / B 步数。
-  - 每个 backend 各 episode 录视频 + 画激进度/参数曲线（复用 eval_speedtune.run_backend_episodes）。
+    （两者都统计 250Hz 物理步）。加速比 = A 步数 / B 步数。
+  - 每个 backend 各 episode 录视频 + 画原始 v/vel_limit 曲线（复用 eval_speedtune.run_backend_episodes）。
   - 额外产出对比图(compare_speedup.png / compare_knob.png) + 对比表(compare_summary.json)。
 
 VLA(3B) **只加载一次**两 backend 共用（_build_vla），避免双倍显存。两个 backend 各连自己的 env server
@@ -18,8 +18,8 @@ episode 比聚合指标（eval 惯例）。
         --config configs/model/speedtune_dqn_config.py \
         --config_task configs/task/robotwin_stack_blocks.py \
         --backend_a fixed_time          --ckpt_a logs/.../fixed_time/checkpoints/update_<N>        --port_a 8103 \
-        --backend_b per_action_toppra   --ckpt_b logs/.../per_action_toppra/checkpoints/update_<N> --port_b 8102 \
-        --n_episodes 5 --output_dir logs/speedtune_compare
+        --backend_b chunk_toppra        --ckpt_b logs/.../chunk_toppra/checkpoints/update_<N>      --port_b 8102 \
+        --n_episodes 30 --output_dir logs/speedtune_compare
 """
 
 import os
@@ -60,18 +60,6 @@ flags.DEFINE_string("ckpt_b", None, "backend B 的 DQN checkpoint 目录（含 q
 flags.DEFINE_string("backend_b", "chunk_toppra", "backend B 名（被测，默认 chunk_toppra）。")
 flags.DEFINE_integer("port_b", 8103, "backend B 的 env server port。")
 
-# rec 的固定字段（非 speed_params）；用于从 rec 反推该 backend 的实际加速参数 keys。
-_FIXED_REC_KEYS = {
-    "step", "t_sim", "dense_steps", "aggr_mean", "aggr",
-    "left_gripper", "right_gripper", "left_contact", "right_contact",
-    "exec_status", "success",
-    "reward_values", "execution_steps", "planned_cruise_fraction",
-    "fixed_time_speed_violation", "max_planned_qvel", "vla_wall_s",
-    "dqn_wall_s", "env_rpc_wall_s", "observation_rpc_wall_s",
-    "input_chunk_steps", "requested_execution_steps",
-}
-
-
 def _make_env(out_sub, exec_backend, port, config, config_task):
     """为一个 backend 建 eval env（连其专属 port 的 env server），视频存到 out_sub/videos。"""
     example_action = np.asarray(
@@ -100,11 +88,11 @@ def _representative_episode(episodes):
 
 
 def _param_keys(episode):
-    """从代表 episode 的首个 rec 反推该 backend 实际下发的加速参数 keys（v/vel_limit/acc_limit）。"""
+    """从代表 episode 反推后端实际控制的原始速度参数（v 或 vel_limit）。"""
     if not episode or not episode["recs"]:
         return []
     return [
-        key for key in ("v", "vel_limit", "acc_limit", "derived_acc_limit")
+        key for key in ("v", "vel_limit")
         if key in episode["recs"][0]
     ]
 
@@ -120,14 +108,15 @@ def _ratio(x, y):
 def _save_compare_summary(out_dir, ra, rb):
     """写 compare_summary.json + 打印加速比（dense_steps 为硬可比基准）。"""
     na, nb = ra["exec_backend"], rb["exec_backend"]
-    keep = ("success", "success_rate", "reward_success", "reward_success_rate",
+    keep = ("n_episodes", "success", "success_rate", "reward_success", "reward_success_rate",
             "mean_decision_steps", "mean_decision_steps_success",
             "mean_dense_steps", "mean_dense_steps_success", "mean_sim_time_s",
             "mean_end_to_end_wall_s", "mean_vla_wall_s", "mean_dqn_wall_s",
             "mean_env_rpc_wall_s", "fixed_time_speed_violation_rate", "fallback_rate",
-            "k_skip", "acc_rule", "max_action_idxs", "max_unlocked_speed",
-            "speed_action_counts",
-            "aggr_in_contact_mean", "aggr_free_mean")
+            "k_skip", "max_action_idxs", "max_unlocked_speed",
+            "speed_action_counts", "speed_param_name",
+            "speed_in_contact_mean", "speed_free_mean", "slows_near_contact",
+            "max_planned_qvel", "mean_episode_max_planned_qvel")
     paired = paired_metrics(ra["episodes"], rb["episodes"])
     paired_safe = paired_metrics(
         ra["episodes"], rb["episodes"], success_key="reward_success"
@@ -218,7 +207,7 @@ def _run_paired_video_replay(
 
 
 def _plot_compare(out_dir, ra, rb):
-    """compare_speedup.png（执行步数 bar + 激进度对比）+ compare_knob.png（各 backend 实际参数曲线）。"""
+    """执行步数与后端原始速度参数对比图。"""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -230,7 +219,7 @@ def _plot_compare(out_dir, ra, rb):
     na, nb = ra["exec_backend"], rb["exec_backend"]
     epa, epb = ra["episodes"], rb["episodes"]
 
-    # ---- 图1 compare_speedup.png：per-episode 执行步数 bar + 代表 episode 激进度对比 ----
+    # ---- 图1 compare_speedup.png：per-episode 执行步数 + 代表 episode 原始速度 ----
     n = max(len(epa), len(epb), 1)
     x = np.arange(n)
     w = 0.38
@@ -258,15 +247,16 @@ def _plot_compare(out_dir, ra, rb):
 
     rea, reb = _representative_episode(epa), _representative_episode(epb)
     if rea:
-        axes[1].plot([r["step"] for r in rea["recs"]], [r["aggr_mean"] for r in rea["recs"]],
+        key = ra["speed_param_name"]
+        axes[1].plot([r["step"] for r in rea["recs"]], [r[key] for r in rea["recs"]],
                      "-o", color="tab:orange", ms=3, label=f"{na} ep{rea['ep']}")
     if reb:
-        axes[1].plot([r["step"] for r in reb["recs"]], [r["aggr_mean"] for r in reb["recs"]],
+        key = rb["speed_param_name"]
+        axes[1].plot([r["step"] for r in reb["recs"]], [r[key] for r in reb["recs"]],
                      "-o", color="tab:blue", ms=3, label=f"{nb} ep{reb['ep']}")
     axes[1].set_xlabel("decision step")
-    axes[1].set_ylabel("aggressiveness (0=slow ~ 1=fast)")
-    axes[1].set_ylim(-0.05, 1.05)
-    axes[1].set_title("Normalized aggressiveness vs decision step")
+    axes[1].set_ylabel("raw speed parameter")
+    axes[1].set_title("Raw v / vel_limit vs decision step")
     axes[1].legend(fontsize=9)
 
     sp = paired_metrics(epa, epb)["physics_speedup"]["median"]
@@ -276,7 +266,7 @@ def _plot_compare(out_dir, ra, rb):
     fig.savefig(os.path.join(out_dir, "compare_speedup.png"), dpi=120)
     plt.close(fig)
 
-    # ---- 图2 compare_knob.png：各 backend 实际加速参数 (v/vel_limit/acc_limit) 随决策步 ----
+    # ---- 图2 compare_knob.png：各 backend 原始速度参数随决策步 ----
     fig2, axes2 = plt.subplots(1, 2, figsize=(15, 5), sharey=False)
     for ax, rep, name in ((axes2[0], rea, na), (axes2[1], reb, nb)):
         if not rep:
@@ -287,11 +277,11 @@ def _plot_compare(out_dir, ra, rb):
         for k in _param_keys(rep):
             ax.plot(steps, [r.get(k, np.nan) for r in rep["recs"]], "-o", ms=3, label=k)
         ax.set_xlabel("decision step")
-        ax.set_ylabel("speed param value")
+        ax.set_ylabel("raw speed parameter")
         _tag = " [SUCCESS]" if rep["success"] else " [FAILED]"
         ax.set_title(f"{name} ep{rep['ep']}{_tag}: speed params + grasp/contact")
         ax.legend(fontsize=8)
-    fig2.suptitle("Speed-control params issued per backend, vs decision step")
+    fig2.suptitle("Raw speed parameter issued per backend, vs decision step")
     fig2.tight_layout()
     fig2.savefig(os.path.join(out_dir, "compare_knob.png"), dpi=120)
     plt.close(fig2)
