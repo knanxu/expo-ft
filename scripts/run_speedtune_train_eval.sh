@@ -13,7 +13,10 @@ PYTHON="${PYTHON:-uv run python}"
 TASK_CONFIG="${TASK_CONFIG:-configs/task/robotwin_stack_blocks.py}"
 MODEL_CONFIG="${MODEL_CONFIG:-configs/model/speedtune_dqn_config.py}"
 WANDB_PROJECT="${WANDB_PROJECT:-expo-ft-speedtune}"
-MAX_ITERS="${MAX_ITERS:-40000}"
+# MAX_ITERS counts SpeedTune decisions, not dense physics/action steps.
+# With whole-chunk execution_steps=40, 20k decisions roughly matches the
+# previous 40k-decision budget at execution_steps=20 in executed action budget.
+MAX_ITERS="${MAX_ITERS:-20000}"
 SEED="${SEED:-42}"
 SERVER_WAIT="${SERVER_WAIT:-90}"
 TRAIN_MEM_FRAC="${TRAIN_MEM_FRAC:-0.85}"
@@ -138,9 +141,12 @@ OUTPUT_DIR="$LOGDIR/compare_eval"
 
 if [ "$DRY_RUN" = "1" ]; then
   echo "[DRY-RUN] backends: ${BACKENDS[*]}"
+  echo "[DRY-RUN] max_iters: $MAX_ITERS"
   echo "[DRY-RUN] n_episodes: $N_EPISODES"
   echo "[DRY-RUN] video_episodes: $VIDEO_EPISODES"
+  echo "[DRY-RUN] stream_hold_steps: $STREAM_HOLD_STEPS"
   echo "[DRY-RUN] chunk_toppra_k_skip: $CHUNK_TOPPRA_K_SKIP"
+  echo "[DRY-RUN] max_decision_steps: $MAX_DECISION_STEPS"
   echo "[DRY-RUN] train_mode: $TRAIN_MODE"
   echo "[DRY-RUN] trainer: $TRAIN_ENTRY"
   echo "[DRY-RUN] expo_commit: $EXPO_COMMIT"

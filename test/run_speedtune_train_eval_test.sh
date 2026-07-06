@@ -6,6 +6,7 @@ SCRIPT="$ROOT/scripts/run_speedtune_train_eval.sh"
 
 [ -x "$SCRIPT" ]
 grep -q 'BACKENDS=(fixed_time chunk_toppra)' "$SCRIPT"
+grep -q 'MAX_ITERS="${MAX_ITERS:-20000}"' "$SCRIPT"
 grep -q 'N_EPISODES="${N_EPISODES:-30}"' "$SCRIPT"
 grep -q 'VIDEO_EPISODES="${VIDEO_EPISODES:-5}"' "$SCRIPT"
 grep -q 'CHUNK_TOPPRA_K_SKIP="${CHUNK_TOPPRA_K_SKIP:-40}"' "$SCRIPT"
@@ -27,8 +28,11 @@ output="$({
     bash "$SCRIPT"
 } 2>&1)"
 grep -q 'backends: fixed_time chunk_toppra' <<<"$output"
+grep -q 'max_iters: 20000' <<<"$output"
 grep -q 'n_episodes: 30' <<<"$output"
+grep -q 'stream_hold_steps: 15' <<<"$output"
 grep -q 'chunk_toppra_k_skip: 40' <<<"$output"
+grep -q 'max_decision_steps: 400' <<<"$output"
 grep -q 'train_mode: sync' <<<"$output"
 grep -q 'trainer: train_speedtune_sync.py' <<<"$output"
 grep -q 'video_episodes: 5' <<<"$output"
@@ -50,6 +54,11 @@ kskip_override="$(DRY_RUN=1 BACKENDS='chunk_toppra' CHUNK_TOPPRA_K_SKIP=37 \
   EXPO_ROOT="$ROOT" ROBOTWIN_ROOT="/home/xukainan/RoboTwin" \
   SPEEDTUNE_VLA_CKPT="$tmp/vla.ckpt" bash "$SCRIPT" 2>&1)"
 grep -q 'chunk_toppra_k_skip: 37' <<<"$kskip_override"
+
+max_iters_override="$(DRY_RUN=1 MAX_ITERS=1234 \
+  EXPO_ROOT="$ROOT" ROBOTWIN_ROOT="/home/xukainan/RoboTwin" \
+  SPEEDTUNE_VLA_CKPT="$tmp/vla.ckpt" bash "$SCRIPT" 2>&1)"
+grep -q 'max_iters: 1234' <<<"$max_iters_override"
 
 async_mode="$(DRY_RUN=1 TRAIN_MODE=async \
   EXPO_ROOT="$ROOT" ROBOTWIN_ROOT="/home/xukainan/RoboTwin" \

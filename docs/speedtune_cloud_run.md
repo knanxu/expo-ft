@@ -24,7 +24,9 @@ DRY_RUN=1 bash scripts/run_speedtune_train_eval.sh
 
 ```text
 backends: fixed_time chunk_toppra
+max_iters: 20000
 n_episodes: 30
+chunk_toppra_k_skip: 40
 backend_a=fixed_time ... backend_b=chunk_toppra
 ```
 
@@ -40,6 +42,14 @@ MAX_ITERS=2000 N_EPISODES=3 bash scripts/run_speedtune_train_eval.sh
 
 ```bash
 bash scripts/run_speedtune_train_eval.sh
+```
+
+默认 `CHUNK_TOPPRA_K_SKIP=40`，训练预算默认 `MAX_ITERS=20000`。这里的 `MAX_ITERS`
+计的是 SpeedTune 决策步，不是 dense physics/action steps；K=40 下 20000 decisions
+大致对齐旧 K=20、40000 decisions 的执行动作预算。需要更长训练时显式覆盖：
+
+```bash
+MAX_ITERS=40000 bash scripts/run_speedtune_train_eval.sh
 ```
 
 仍可选择其它 1–2 个后端：
