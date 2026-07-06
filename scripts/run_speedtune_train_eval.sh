@@ -19,6 +19,7 @@ SERVER_WAIT="${SERVER_WAIT:-90}"
 TRAIN_MEM_FRAC="${TRAIN_MEM_FRAC:-0.85}"
 COMPARE_MEM_FRAC="${COMPARE_MEM_FRAC:-0.85}"
 STREAM_HOLD_STEPS="${STREAM_HOLD_STEPS:-15}"
+CHUNK_TOPPRA_K_SKIP="${CHUNK_TOPPRA_K_SKIP:-40}"
 N_EPISODES="${N_EPISODES:-30}"
 VIDEO_EPISODES="${VIDEO_EPISODES:-5}"
 MAX_DECISION_STEPS="${MAX_DECISION_STEPS:-400}"
@@ -139,6 +140,7 @@ if [ "$DRY_RUN" = "1" ]; then
   echo "[DRY-RUN] backends: ${BACKENDS[*]}"
   echo "[DRY-RUN] n_episodes: $N_EPISODES"
   echo "[DRY-RUN] video_episodes: $VIDEO_EPISODES"
+  echo "[DRY-RUN] chunk_toppra_k_skip: $CHUNK_TOPPRA_K_SKIP"
   echo "[DRY-RUN] train_mode: $TRAIN_MODE"
   echo "[DRY-RUN] trainer: $TRAIN_ENTRY"
   echo "[DRY-RUN] expo_commit: $EXPO_COMMIT"
@@ -239,7 +241,8 @@ for i in "${!BACKENDS[@]}"; do
   setsid env CUDA_VISIBLE_DEVICES="$gpu" XLA_PYTHON_CLIENT_MEM_FRACTION="$TRAIN_MEM_FRAC" \
     WANDB_PROJECT="$WANDB_PROJECT" "${PYTHON_CMD[@]}" "$TRAIN_ENTRY" \
       --config "$MODEL_CONFIG" --config.exec_backend "$be" --config.max_iters "$MAX_ITERS" \
-      --config.stream_hold_steps "$STREAM_HOLD_STEPS" --config_task "$TASK_CONFIG" \
+      --config.stream_hold_steps "$STREAM_HOLD_STEPS" \
+      --config.chunk_toppra_k_skip "$CHUNK_TOPPRA_K_SKIP" --config_task "$TASK_CONFIG" \
       --client_host localhost --client_port "$port" --seed "$SEED" \
       --project_name "$WANDB_PROJECT" --run_name "$run_name" --output_dir "$LOGDIR" \
       >"$log" 2>&1 &
@@ -267,6 +270,7 @@ if [ "${#BACKENDS[@]}" -eq 2 ]; then
   setsid env CUDA_VISIBLE_DEVICES="$COMPARE_GPU" XLA_PYTHON_CLIENT_MEM_FRACTION="$COMPARE_MEM_FRAC" \
     "${PYTHON_CMD[@]}" eval_speedtune_compare.py --config "$MODEL_CONFIG" --config_task "$TASK_CONFIG" \
       --config.stream_hold_steps "$STREAM_HOLD_STEPS" \
+      --config.chunk_toppra_k_skip "$CHUNK_TOPPRA_K_SKIP" \
       --backend_a "${BACKENDS[0]}" --ckpt_a "${CKPTS[0]}" --port_a "${PORTS[0]}" \
       --backend_b "${BACKENDS[1]}" --ckpt_b "${CKPTS[1]}" --port_b "${PORTS[1]}" \
       --n_episodes "$N_EPISODES" --seed "$SEED" --max_decision_steps "$MAX_DECISION_STEPS" \
@@ -276,6 +280,7 @@ else
   setsid env CUDA_VISIBLE_DEVICES="$COMPARE_GPU" XLA_PYTHON_CLIENT_MEM_FRACTION="$COMPARE_MEM_FRAC" \
     "${PYTHON_CMD[@]}" eval_speedtune.py --config "$MODEL_CONFIG" \
       --config.exec_backend "${BACKENDS[0]}" --config.stream_hold_steps "$STREAM_HOLD_STEPS" \
+      --config.chunk_toppra_k_skip "$CHUNK_TOPPRA_K_SKIP" \
       --config_task "$TASK_CONFIG" --dqn_ckpt "${CKPTS[0]}" --client_port "${PORTS[0]}" \
       --n_episodes "$N_EPISODES" --seed "$SEED" --max_decision_steps "$MAX_DECISION_STEPS" \
       --record_video --video_episodes "$VIDEO_EPISODES" \
