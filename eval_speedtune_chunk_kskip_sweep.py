@@ -33,7 +33,7 @@ import eval_speedtune as ev
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string("vel_limits", "1,1.5,2,2.5,3,3.5,4", "Raw chunk_toppra vel_limit grid.")
-flags.DEFINE_string("k_skips", "10,20,40,50", "Whole-chunk execution_steps/k_skip grid.")
+flags.DEFINE_string("k_skips", "10,20,30,40,50", "Whole-chunk execution_steps/k_skip grid.")
 flags.DEFINE_integer("chunk_toppra_port", 8102, "chunk_toppra RoboTwin server port.")
 
 

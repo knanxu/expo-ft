@@ -7,11 +7,12 @@ SCRIPT="$ROOT/scripts/run_wholechunk_kskip_vel_sweep.sh"
 [ -x "$SCRIPT" ]
 grep -q 'N_EPISODES="${N_EPISODES:-50}"' "$SCRIPT"
 grep -q 'VEL_LIMITS="${VEL_LIMITS:-1,1.5,2,2.5,3,3.5,4}"' "$SCRIPT"
-grep -q 'K_SKIPS="${K_SKIPS:-10,20,40,50}"' "$SCRIPT"
+grep -q 'K_SKIPS="${K_SKIPS:-10,20,30,40,50}"' "$SCRIPT"
 grep -q 'eval_speedtune_chunk_kskip_sweep.py' "$SCRIPT"
 grep -q -- '--vel_limits "$VEL_LIMITS"' "$SCRIPT"
 grep -q -- '--k_skips "$K_SKIPS"' "$SCRIPT"
 grep -q 'kill -TERM -- "-\$pid"' "$SCRIPT"
+grep -q 'flags.DEFINE_string("k_skips", "10,20,30,40,50"' "$ROOT/eval_speedtune_chunk_kskip_sweep.py"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -22,9 +23,9 @@ output="$(DRY_RUN=1 EXPO_ROOT="$ROOT" ROBOTWIN_ROOT="/home/xukainan/RoboTwin" \
 grep -q 'backend: chunk_toppra' <<<"$output"
 grep -q 'n_episodes_per_config: 50' <<<"$output"
 grep -q 'vel_limits: 1,1.5,2,2.5,3,3.5,4' <<<"$output"
-grep -q 'k_skips: 10,20,40,50' <<<"$output"
-grep -q 'total_configs: 28' <<<"$output"
-grep -q 'total_episodes: 1400' <<<"$output"
+grep -q 'k_skips: 10,20,30,40,50' <<<"$output"
+grep -q 'total_configs: 35' <<<"$output"
+grep -q 'total_episodes: 1750' <<<"$output"
 grep -q 'server backend=chunk_toppra' <<<"$output"
 grep -q 'eval entrypoint=eval_speedtune_chunk_kskip_sweep.py' <<<"$output"
 

@@ -32,8 +32,8 @@ def _result(k_skip=40, success=35, success_steps=1000.0):
 
 
 def test_default_k_skip_grid_and_parser():
-    assert DEFAULT_K_SKIPS == (10, 20, 40, 50)
-    assert parse_k_skips("10,20,40,50") == DEFAULT_K_SKIPS
+    assert DEFAULT_K_SKIPS == (10, 20, 30, 40, 50)
+    assert parse_k_skips("10,20,30,40,50") == DEFAULT_K_SKIPS
 
 
 def test_parse_k_skips_rejects_duplicates_unsorted_and_out_of_horizon():

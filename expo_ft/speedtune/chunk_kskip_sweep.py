@@ -9,7 +9,7 @@ import os
 from typing import Iterable, Mapping, Sequence
 
 
-DEFAULT_K_SKIPS = (10, 20, 40, 50)
+DEFAULT_K_SKIPS = (10, 20, 30, 40, 50)
 
 
 def parse_k_skips(spec: str | Iterable[int], *, max_k: int = 50) -> tuple[int, ...]:
