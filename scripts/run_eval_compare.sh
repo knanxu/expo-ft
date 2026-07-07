@@ -30,6 +30,8 @@ SEED="${SEED:-0}"
 MAX_DECISION_STEPS="${MAX_DECISION_STEPS:-400}"
 # fixed_time(streaming) 每 action hold 的物理步：250/这个=等效控制Hz；务必与训练时一致（默认 15）。
 STREAM_HOLD_STEPS="${STREAM_HOLD_STEPS:-15}"
+FIXED_TIME_K_SKIP="${FIXED_TIME_K_SKIP:-10}"
+CHUNK_TOPPRA_K_SKIP="${CHUNK_TOPPRA_K_SKIP:-40}"
 SERVER_WAIT="${SERVER_WAIT:-45}"                   # 等 server 渲染自检/就绪秒数
 COMPARE_MEM_FRAC="${COMPARE_MEM_FRAC:-0.85}"       # compare(3B VLA) 单卡显存上限
 
@@ -59,6 +61,7 @@ mkdir -p "$OUTPUT_DIR"
 echo "[*] 输出目录: $OUTPUT_DIR"
 echo "[*] A=$BACKEND_A (port $PORT_A, GPU ${SERVER_GPUS[0]}, ckpt $CKPT_A)"
 echo "[*] B=$BACKEND_B (port $PORT_B, GPU ${SERVER_GPUS[1]}, ckpt $CKPT_B)"
+echo "[*] k_skip fixed_time=$FIXED_TIME_K_SKIP chunk_toppra=$CHUNK_TOPPRA_K_SKIP"
 echo "[*] compare→GPU $COMPARE_GPU | 冻结 VLA: $SPEEDTUNE_VLA_CKPT"
 
 PIDS=()
@@ -130,6 +133,8 @@ CUDA_VISIBLE_DEVICES="$COMPARE_GPU" XLA_PYTHON_CLIENT_MEM_FRACTION="$COMPARE_MEM
     --config "$MODEL_CONFIG" \
     --config_task "$TASK_CONFIG" \
     --config.stream_hold_steps "$STREAM_HOLD_STEPS" \
+    --config.fixed_time_k_skip "$FIXED_TIME_K_SKIP" \
+    --config.chunk_toppra_k_skip "$CHUNK_TOPPRA_K_SKIP" \
     --backend_a "$BACKEND_A" --ckpt_a "$CKPT_A" --port_a "$PORT_A" \
     --backend_b "$BACKEND_B" --ckpt_b "$CKPT_B" --port_b "$PORT_B" \
     --n_episodes "$N_EPISODES" --seed "$SEED" \

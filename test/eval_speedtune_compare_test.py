@@ -77,6 +77,10 @@ def test_standalone_compare_launcher_defaults_to_30_fixed_vs_chunk_episodes():
     assert 'N_EPISODES="${N_EPISODES:-30}"' in text
     assert 'BACKEND_A="${BACKEND_A:-fixed_time}"' in text
     assert 'BACKEND_B="${BACKEND_B:-chunk_toppra}"' in text
+    assert 'FIXED_TIME_K_SKIP="${FIXED_TIME_K_SKIP:-10}"' in text
+    assert 'CHUNK_TOPPRA_K_SKIP="${CHUNK_TOPPRA_K_SKIP:-40}"' in text
+    assert '--config.fixed_time_k_skip "$FIXED_TIME_K_SKIP"' in text
+    assert '--config.chunk_toppra_k_skip "$CHUNK_TOPPRA_K_SKIP"' in text
     assert "setsid env CUDA_VISIBLE_DEVICES" in text
     assert 'kill -TERM -- "-$p"' in text
 

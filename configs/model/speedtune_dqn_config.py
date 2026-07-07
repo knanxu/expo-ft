@@ -42,7 +42,7 @@ def get_config():
     # 不做 reconstruct(v)，使用更长窗口提高单次 TOPPRA 的有效路径长度。
     config.k_skip = 10                    # per_action 兼容默认
     config.fixed_time_k_skip = 10
-    config.chunk_toppra_k_skip = 20
+    config.chunk_toppra_k_skip = 40
     config.stream_hold_steps = 15        # fixed_time(streaming) 每目标 hold 物理步（250/15≈16.7Hz，对齐采集）
 
     # --- 动作时序：drift 双臂 chunk H=50；SpeedTune 决策粒度 = 一整段 chunk ---
