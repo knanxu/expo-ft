@@ -49,10 +49,19 @@ def test_paper_speedtuning_support_scales_with_alpha():
     config.reward_mode = "paper_speedtuning"
     config.reward_alpha = 1e-4
     config.reward_beta = 2.0
-    support = backend_support(config, "fixed_time")
-    expected_max = 1.0 + finite_horizon_q_max(1e-4 * 4.0 ** 2, config.gamma, 800)
-    assert support[0] == 0.0
-    assert abs(support[1] - expected_max) < 1e-9
+    fixed_support = backend_support(config, "fixed_time")
+    chunk_support = backend_support(config, "chunk_toppra")
+    expected_fixed_max = 1.0 + finite_horizon_q_max(
+        1e-4 * 4.0 ** 2, config.gamma, 800 // config.fixed_time_k_skip
+    )
+    expected_chunk_max = 1.0 + finite_horizon_q_max(
+        1e-4 * 4.0 ** 2, config.gamma, 800 // config.chunk_toppra_k_skip
+    )
+    assert fixed_support[0] == 0.0
+    assert chunk_support[0] == 0.0
+    assert abs(fixed_support[1] - expected_fixed_max) < 1e-9
+    assert abs(chunk_support[1] - expected_chunk_max) < 1e-9
+    assert fixed_support[1] > chunk_support[1]
 
 
 def test_episode_reward_success_gates_task_failure_and_speed_violation():

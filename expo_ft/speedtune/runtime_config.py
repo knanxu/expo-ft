@@ -26,12 +26,15 @@ def backend_support(config, backend_name: str):
         reward_beta = config.get("reward_beta", 2.0)
         reward_alpha = 1.0 if reward_alpha is None else float(reward_alpha)
         reward_beta = 2.0 if reward_beta is None else float(reward_beta)
+        action_steps = int(config.get("paper_speedtuning_episode_steps", 800))
+        k_skip = backend_k_skip(config, backend_name) or 1
+        max_chunks = max(1, (action_steps + int(k_skip) - 1) // int(k_skip))
         max_speed_reward = reward_alpha * (4.0 ** reward_beta)
         support_max = float(config.get("paper_speedtuning_task_reward_max", 1.0))
         support_max += finite_horizon_q_max(
             max_speed_reward,
             float(config.gamma),
-            int(config.get("paper_speedtuning_episode_steps", 800)),
+            max_chunks,
         )
         return 0.0, float(support_max)
 

@@ -19,35 +19,21 @@ r_speed(v) = v^beta
 2. `"success_gated"` 走现有逻辑，不改变旧实验含义。
 3. `"paper_speedtuning"` 复现论文 reward：速度项不 success-gated，失败时也保留 `alpha * v^beta`，不额外加入失败速度惩罚。
 4. 任务 reward 只用环境本身返回的 `r_task`。通常只有 terminal transition 有 `r_task=1`，不把成功 reward relabel 到全 episode。
-5. 当前训练只存每个 DQN 决策的一条 macro transition。为对应论文 inner-loop reward，macro reward 必须按 `execution_steps` 聚合。
-6. ReplayBuffer 的 bootstrap discount 必须从固定 `gamma` 扩展为每条 transition 自带的 `gamma^execution_steps`，n-step return 也用这些 variable discounts。
+5. 当前训练只存每个 DQN 决策的一条 transition；SpeedTuning 论文的 action、reward 和 discount 都是在 chunk 这一层定义，不展开 chunk 内组成动作。
+6. ReplayBuffer 可保留 per-transition discount 能力，但 paper baseline 写入 replay 时使用 chunk-level `gamma`，不是 `gamma^execution_steps`。
 
 ## Reward 和 Discount 语义
 
-对一个 macro transition，设实际执行的高层 action 数为 `k = execution_steps`，速度 reward 输入为 `v_list`，折扣为 `gamma`。
-
-速度项在 macro 内每个 inner step 都给：
+对一个 chunk transition，速度 reward 输入为 `v_list`，折扣为 `gamma`。论文 baseline 不把 chunk 内组成动作展开为多个 DQN transition。
 
 ```text
-speed_reward_macro = alpha * sum_i(v_i^beta) * (1 - gamma^k) / (1 - gamma)
+reward_chunk = alpha * sum_i(v_i^beta) + r_task
 ```
 
-若 `gamma == 1`，则使用：
+任务项只来自当前 chunk 的环境返回 `r_task`；通常只有 terminal chunk 为 1，不把成功 reward relabel 到全 episode。写入 replay 的 transition discount 为：
 
 ```text
-speed_reward_macro = alpha * sum_i(v_i^beta) * k
-```
-
-任务项只来自当前 macro 末尾环境返回的 `r_task`，按 macro 内最后一步位置折扣：
-
-```text
-task_reward_macro = gamma^(k - 1) * r_task
-```
-
-写入 replay 的 transition discount 为：
-
-```text
-transition_discount = gamma^k
+transition_discount = gamma
 ```
 
 若 transition `done=True`，ReplayBuffer 在 n-step 聚合时仍把 bootstrap discount 截断为 0。
@@ -56,19 +42,19 @@ transition_discount = gamma^k
 
 论文未给固定 `alpha`，这里不写死。由于 paper mode 会给失败 episode 速度 reward，`alpha` 决定“追速度”和“等 terminal success”的比例。
 
-在 `gamma=0.99`、max raw speed `v=4`、`beta=2`、每 episode 约 800 个 high-level action step 时，最大速度项折扣总和约为：
+在 `gamma=0.99`、max raw speed `v=4`、`beta=2` 时，单个 chunk 的最大速度项为 16。C51 support 按最多 chunk 决策数估算，例如 fixed-time `k_skip=10`、800 个高层 action step 约为 80 个 chunk：
 
 ```text
-16 * (1 - 0.99^800) / (1 - 0.99) ~= 1599.5
+16 * (1 - 0.99^80) / (1 - 0.99) ~= 884.0
 ```
 
 因此：
 
 ```text
-alpha=1e-5  -> max speed return ~= 0.016
-alpha=1e-4  -> max speed return ~= 0.160
-alpha=3e-4  -> max speed return ~= 0.480
-alpha=1e-3  -> max speed return ~= 1.600
+alpha=1e-5  -> fixed-time max speed return ~= 0.0088
+alpha=1e-4  -> fixed-time max speed return ~= 0.0884
+alpha=3e-4  -> fixed-time max speed return ~= 0.265
+alpha=1e-3  -> fixed-time max speed return ~= 0.884
 ```
 
 为了复现 baseline 且避免 C51 support 太粗，paper mode 的 support 应随 `alpha` 和 `beta` 动态缩放，而不是沿用 success-gated 的 `[0,900]` / `[0,550]`。
@@ -89,7 +75,7 @@ epsilon_decay_steps in {1000, 2000, 4000}
 
 - `configs/model/speedtune_dqn_config.py`：新增 `reward_mode`、paper support 估算所需 horizon 参数，并把 epsilon decay 默认调小。
 - `expo_ft/speedtune/runtime_config.py`：根据 reward mode 返回 backend support；paper mode 支持动态 C51 support。
-- `expo_ft/speedtune/training_runtime.py`：新增 paper reward helper，并在 `flush_pending_episode` 内按 mode 选择 reward/discount。
+- `expo_ft/speedtune/training_runtime.py`：新增 paper reward helper，并在 `flush_pending_episode` 内按 mode 选择 reward；paper 和 success-gated 都按 chunk 写入 `gamma`。
 - `expo_ft/data/speedtune_buffer.py`：`insert` 增加可选 `discount`，默认仍为 `self.gamma`，旧调用不受影响。
 - `train_speedtune_async.py` 和 `train_speedtune_sync.py`：pending transition 保存 `execution_steps`，flush 时传入 reward mode / alpha / beta / gamma。
 - `test/*speedtune*`：用 TDD 增加 variable discount、paper reward、配置和训练脚本接线测试。
@@ -100,9 +86,9 @@ epsilon_decay_steps in {1000, 2000, 4000}
    - reward 使用每条 transition 的折扣累计；
    - terminal transition bootstrap discount 为 0。
 2. Runtime 单元测试覆盖 paper mode：
-   - `execution_steps=3, gamma=0.5, alpha=0.1, beta=2, v=4` 时 reward 为 `0.1*16*(1+0.5+0.25) + 0.5^2*r_task`；
+   - `execution_steps=3, gamma=0.5, alpha=0.1, beta=2, v=4` 时 reward 仍为 chunk-level `0.1*16 + r_task`；
    - 失败 episode 仍保留速度 reward；
-   - `discount` 参数写入为 `gamma^execution_steps`。
+   - `discount` 参数写入为 `gamma`。
 3. Config 测试覆盖默认 mode 不变、paper mode support 随 alpha 缩放。
 4. 训练脚本源码测试覆盖 pending transition 包含 `execution_steps`，flush 调用传入 reward config。
 
@@ -111,4 +97,4 @@ epsilon_decay_steps in {1000, 2000, 4000}
 - 没有改动现有 success-gated reward 的默认语义。
 - paper mode 不加失败速度惩罚，符合 baseline 复现要求。
 - 任务 reward 不 episode-wide relabel，符合“只给最后一个 transition”的要求。
-- 折扣使用 `gamma^execution_steps`，不是 `gamma^n_exec_steps` 或物理仿真 dense step。
+- 折扣使用 chunk-level `gamma`，不是 `gamma^execution_steps`、`gamma^n_exec_steps` 或物理仿真 dense step。

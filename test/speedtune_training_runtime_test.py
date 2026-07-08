@@ -135,7 +135,7 @@ def test_forced_terminal_flushes_partial_episode_without_success_reward():
     np.testing.assert_array_equal(buffer.inserted[0][3], np.asarray([1.0]))
 
 
-def test_paper_speedtuning_reward_uses_execution_step_discount():
+def test_paper_speedtuning_reward_and_discount_are_chunk_level():
     pending = [
         {
             "feat": np.asarray([0.0]),
@@ -162,9 +162,9 @@ def test_paper_speedtuning_reward_uses_execution_step_discount():
         gamma=0.5,
     )
 
-    expected_reward = 0.1 * 16.0 * (1.0 + 0.5 + 0.25) + 0.25
+    expected_reward = 0.1 * 16.0 + 1.0
     assert abs(buffer.inserted[0][2] - expected_reward) < 1e-6
-    assert abs(buffer.inserted[0][5] - 0.125) < 1e-9
+    assert abs(buffer.inserted[0][5] - 0.5) < 1e-9
     assert summary["reward_success"] is True
     assert summary["speed_violation"] is True
     assert summary["execution_steps"] == 3
@@ -197,11 +197,12 @@ def test_paper_speedtuning_failure_keeps_speed_reward_without_penalty():
         gamma=0.5,
     )
 
-    assert abs(buffer.inserted[0][2] - 2.4) < 1e-6
+    assert abs(buffer.inserted[0][2] - 1.6) < 1e-6
+    assert abs(buffer.inserted[0][5] - 0.5) < 1e-9
     assert summary["reward_success"] is False
 
 
-def test_success_gated_reward_uses_execution_step_discount():
+def test_success_gated_reward_uses_chunk_level_discount():
     pending = [
         {
             "feat": np.asarray([0.0]),
@@ -227,7 +228,7 @@ def test_success_gated_reward_uses_execution_step_discount():
     )
 
     assert buffer.inserted[0][2] == 16.0
-    assert abs(buffer.inserted[0][5] - 0.0625) < 1e-9
+    assert abs(buffer.inserted[0][5] - 0.5) < 1e-9
     assert summary["reward_success"] is True
 
 

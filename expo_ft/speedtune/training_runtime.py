@@ -9,30 +9,16 @@ import numpy as np
 from expo_ft.speedtune.runtime_config import episode_reward_success
 
 
-def discounted_geometric_sum(gamma: float, steps: int) -> float:
-    """Return ``sum_{i=0}^{steps-1} gamma^i`` for macro-step reward folding."""
-    steps = max(int(steps), 1)
-    gamma = float(gamma)
-    if abs(gamma - 1.0) < 1e-12:
-        return float(steps)
-    return float((1.0 - gamma ** steps) / (1.0 - gamma))
-
-
 def paper_speedtuning_reward(
     v_list: Sequence[float],
     r_task: float,
     *,
     alpha: float,
     beta: float,
-    gamma: float,
-    execution_steps: int,
 ) -> float:
-    """Fold the paper SpeedTuning inner-loop reward into one macro transition."""
-    steps = max(int(execution_steps), 1)
+    """Paper SpeedTuning reward for one chunk-level DQN transition."""
     speed = sum(max(0.0, float(value)) ** float(beta) for value in v_list)
-    speed_reward = float(alpha) * speed * discounted_geometric_sum(gamma, steps)
-    task_reward = (float(gamma) ** (steps - 1)) * float(r_task)
-    return float(speed_reward + task_reward)
+    return float(float(alpha) * speed + float(r_task))
 
 
 def update_ready(
@@ -145,8 +131,6 @@ def flush_pending_episode(
                 r_task,
                 alpha=float(reward_alpha),
                 beta=float(reward_beta),
-                gamma=float(gamma),
-                execution_steps=execution_steps,
             )
             buffer.insert(
                 transition["feat"],
@@ -154,7 +138,7 @@ def flush_pending_episode(
                 reward,
                 next_feat,
                 done,
-                discount=float(gamma) ** execution_steps,
+                discount=float(gamma),
             )
         else:
             reward = backend.total_reward(
@@ -166,7 +150,7 @@ def flush_pending_episode(
                 reward,
                 next_feat,
                 done,
-                discount=float(gamma) ** execution_steps,
+                discount=float(gamma),
             )
 
     return {

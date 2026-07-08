@@ -99,7 +99,8 @@ def get_config():
     config.reward_mode = "success_gated"
     config.reward_alpha = 1.0
     config.reward_beta = 2.0
-    # Paper mode 的 C51 support 动态估计用高层 action step 数，不用物理仿真 dense step。
+    # Paper mode 的 C51 support 动态估计用高层 action step 预算推导最多 chunk 决策数；
+    # reward/discount 本身仍按一个 chunk 一个 DQN transition 计算。
     config.paper_speedtuning_episode_steps = 800
     config.paper_speedtuning_task_reward_max = 1.0
 

@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a config-selectable paper SpeedTuning reward mode with execution-step discounting while preserving the current success-gated default.
+**Goal:** Add a config-selectable paper SpeedTuning reward mode with chunk-level reward/discount while preserving the current success-gated default.
 
-**Architecture:** Keep reward selection inside `flush_pending_episode`, because that is the existing episode relabel boundary. Extend `SpeedTuneReplayBuffer` to accept per-transition discounts so paper mode can store `gamma^execution_steps` and n-step aggregation can propagate variable macro durations. Use dynamic C51 support for paper mode so alpha sweeps keep useful atom resolution.
+**Architecture:** Keep reward selection inside `flush_pending_episode`, because that is the existing episode relabel boundary. The SpeedTuning paper baseline treats one chunk as the action/reward/discount unit, so paper mode stores one chunk-level reward and one `gamma` per DQN transition. `SpeedTuneReplayBuffer` still accepts per-transition discounts for compatibility/future use. Use dynamic C51 support for paper mode so alpha sweeps keep useful atom resolution.
 
 **Tech Stack:** Python, numpy, ml_collections ConfigDict, existing SpeedTune DQN and local script-style tests.
 
@@ -75,7 +75,7 @@ Expected: all buffer tests pass.
 Update `FakeBuffer.insert` in `test/speedtune_training_runtime_test.py` to accept `discount=None` and store it. Add:
 
 ```python
-def test_paper_speedtuning_reward_uses_execution_step_discount():
+def test_paper_speedtuning_reward_and_discount_are_chunk_level():
     pending = [{
         "feat": np.asarray([0.0]),
         "action_idxs": np.asarray([0]),
@@ -100,9 +100,9 @@ def test_paper_speedtuning_reward_uses_execution_step_discount():
         gamma=0.5,
     )
 
-    expected_reward = 0.1 * 16.0 * (1.0 + 0.5 + 0.25) + 0.25
+    expected_reward = 0.1 * 16.0 + 1.0
     assert abs(buffer.inserted[0][2] - expected_reward) < 1e-6
-    assert abs(buffer.inserted[0][5] - 0.125) < 1e-9
+    assert abs(buffer.inserted[0][5] - 0.5) < 1e-9
     assert summary["reward_success"] is True
     assert summary["execution_steps"] == 3
 
@@ -132,7 +132,7 @@ def test_paper_speedtuning_failure_keeps_speed_reward_without_penalty():
         gamma=0.5,
     )
 
-    assert abs(buffer.inserted[0][2] - 2.4) < 1e-6
+    assert abs(buffer.inserted[0][2] - 1.6) < 1e-6
     assert summary["reward_success"] is False
 ```
 
@@ -141,7 +141,7 @@ def test_paper_speedtuning_failure_keeps_speed_reward_without_penalty():
 Run:
 
 ```bash
-python -m pytest test/speedtune_training_runtime_test.py::test_paper_speedtuning_reward_uses_execution_step_discount test/speedtune_training_runtime_test.py::test_paper_speedtuning_failure_keeps_speed_reward_without_penalty -q
+python -m pytest test/speedtune_training_runtime_test.py::test_paper_speedtuning_reward_and_discount_are_chunk_level test/speedtune_training_runtime_test.py::test_paper_speedtuning_failure_keeps_speed_reward_without_penalty -q
 ```
 
 Expected: fail because `flush_pending_episode` does not accept `reward_mode`.
@@ -151,20 +151,9 @@ Expected: fail because `flush_pending_episode` does not accept `reward_mode`.
 Add helper functions in `training_runtime.py`:
 
 ```python
-def discounted_geometric_sum(gamma: float, steps: int) -> float:
-    steps = max(int(steps), 1)
-    gamma = float(gamma)
-    if abs(gamma - 1.0) < 1e-12:
-        return float(steps)
-    return float((1.0 - gamma ** steps) / (1.0 - gamma))
-
-
-def paper_speedtuning_reward(v_list, r_task, *, alpha, beta, gamma, execution_steps):
+def paper_speedtuning_reward(v_list, r_task, *, alpha, beta):
     speed = sum(max(0.0, float(v)) ** float(beta) for v in v_list)
-    steps = max(int(execution_steps), 1)
-    speed_reward = float(alpha) * speed * discounted_geometric_sum(gamma, steps)
-    task_reward = (float(gamma) ** (steps - 1)) * float(r_task)
-    return float(speed_reward + task_reward)
+    return float(float(alpha) * speed + float(r_task))
 ```
 
 Extend `flush_pending_episode` with keyword args:
@@ -176,7 +165,7 @@ reward_beta: float = 2.0,
 gamma: float = 0.99,
 ```
 
-When `reward_mode == "paper_speedtuning"`, pass `discount=gamma ** execution_steps` to the buffer and use `r_task=0` for forced terminal partial flushes. Otherwise keep old reward and omit `discount`.
+When `reward_mode == "paper_speedtuning"`, pass chunk-level `discount=gamma` to the buffer and use `r_task=0` for forced terminal partial flushes. The default success-gated mode also writes chunk-level `gamma`.
 
 - [x] **Step 4: Run runtime tests**
 
@@ -213,7 +202,9 @@ def test_paper_speedtuning_support_scales_with_alpha():
     config.reward_alpha = 1e-4
     config.reward_beta = 2.0
     support = backend_support(config, "fixed_time")
-    expected_max = 1.0 + finite_horizon_q_max(1e-4 * 4.0 ** 2, config.gamma, 800)
+    expected_max = 1.0 + finite_horizon_q_max(
+        1e-4 * 4.0 ** 2, config.gamma, 800 // config.fixed_time_k_skip
+    )
     assert support[0] == 0.0
     assert abs(support[1] - expected_max) < 1e-9
 ```
@@ -244,9 +235,8 @@ In `runtime_config.backend_support`, if `reward_mode == "paper_speedtuning"`, co
 
 ```python
 max_speed_reward = reward_alpha * (4.0 ** reward_beta)
-support_max = task_reward_max + finite_horizon_q_max(
-    max_speed_reward, gamma, paper_speedtuning_episode_steps
-)
+max_chunks = paper_speedtuning_episode_steps // fixed_time_k_skip
+support_max = task_reward_max + finite_horizon_q_max(max_speed_reward, gamma, max_chunks)
 return 0.0, float(support_max)
 ```
 
@@ -339,6 +329,6 @@ Expected: only scoped changes for paper reward, variable discount, config, tests
 
 ## Plan Self-Review
 
-- Spec coverage: reward mode, alpha, no failure speed penalty, final-task reward, and `gamma^execution_steps` are covered by Tasks 1-4.
+- Spec coverage: reward mode, alpha, no failure speed penalty, final-task reward, and chunk-level `gamma` are covered by Tasks 1-4.
 - Placeholder scan: no TBD/TODO placeholders remain.
 - Type consistency: `execution_steps` is an int, `discount` is optional float, and old buffer callers still work through the default discount.
