@@ -6,6 +6,7 @@
 import numpy as np
 
 from expo_ft.data.speedtune_buffer import SpeedTuneReplayBuffer
+from expo_ft.speedtune.exec_backends import build_backend
 
 FEAT, NH = 4, 3
 
@@ -45,6 +46,25 @@ def test_nstep_aggregation_and_truncation():
     assert abs(R[3] - 4.0) < 1e-5 and disc[3] == 0.0 and dn[3] == 1 and nf[3] == 4
 
 
+def test_variable_transition_discount_enters_nstep_return():
+    buf = SpeedTuneReplayBuffer(
+        capacity=10, feat_dim=FEAT, n_heads=NH, n_step=2, gamma=0.99, seed=0
+    )
+    buf.insert(_feat(0), [0, 0, 0], 1.0, _feat(1), False, discount=0.5)
+    buf.insert(_feat(1), [0, 0, 0], 2.0, _feat(2), False, discount=0.25)
+    buf.insert(_feat(2), [0, 0, 0], 3.0, _feat(3), True, discount=0.1)
+
+    batch = buf.sample(3)
+    order = np.argsort(batch["feat"][:, 0])
+    rewards = batch["reward"][order]
+    discounts = batch["discount"][order]
+    done = batch["done"][order]
+
+    np.testing.assert_allclose(rewards, [2.0, 2.75, 3.0], rtol=1e-6)
+    np.testing.assert_allclose(discounts, [0.125, 0.0, 0.0], rtol=1e-6)
+    np.testing.assert_array_equal(done, [0.0, 1.0, 1.0])
+
+
 def test_action_idxs_preserved():
     buf = _episode_buffer()
     b = buf.sample(4)
@@ -82,6 +102,28 @@ def test_ready():
     for i in range(10):
         buf.insert(_feat(i), [0, 0, 0], 1.0, _feat(i + 1), True)
     assert buf.ready(10)
+
+
+def test_episode_relabelled_raw_speed_reward_enters_nstep_bellman_return():
+    backend = build_backend("fixed_time")
+    buf = SpeedTuneReplayBuffer(
+        capacity=10, feat_dim=FEAT, n_heads=1, n_step=3, gamma=0.99, seed=0
+    )
+    speed_indices = (0, 2, 6)  # raw speeds 1, 2, 4 -> rewards 1, 4, 16
+    for step, index in enumerate(speed_indices):
+        _, reward_values = backend.decode([index])
+        reward = backend.total_reward(0.0, True, reward_values)
+        buf.insert(_feat(step), [index], reward, _feat(step + 1), step == 2)
+    batch = buf.sample(3)
+    order = np.argsort(batch["feat"][:, 0])
+    rewards = batch["reward"][order]
+    expected = np.asarray([
+        1.0 + 0.99 * 4.0 + 0.99 ** 2 * 16.0,
+        4.0 + 0.99 * 16.0,
+        16.0,
+    ])
+    np.testing.assert_allclose(rewards, expected, rtol=1e-6)
+    np.testing.assert_array_equal(batch["discount"][order], np.zeros(3))
 
 
 def main():

@@ -20,6 +20,21 @@ def backend_k_skip(config, backend_name: str):
 
 
 def backend_support(config, backend_name: str):
+    reward_mode = str(config.get("reward_mode", "success_gated"))
+    if reward_mode == "paper_speedtuning":
+        reward_alpha = config.get("reward_alpha", 1.0)
+        reward_beta = config.get("reward_beta", 2.0)
+        reward_alpha = 1.0 if reward_alpha is None else float(reward_alpha)
+        reward_beta = 2.0 if reward_beta is None else float(reward_beta)
+        max_speed_reward = reward_alpha * (4.0 ** reward_beta)
+        support_max = float(config.get("paper_speedtuning_task_reward_max", 1.0))
+        support_max += finite_horizon_q_max(
+            max_speed_reward,
+            float(config.gamma),
+            int(config.get("paper_speedtuning_episode_steps", 800)),
+        )
+        return 0.0, float(support_max)
+
     if backend_name == "fixed_time":
         values = config.fixed_time_support
     elif backend_name == "chunk_toppra":

@@ -35,9 +35,16 @@ class FakeBuffer:
         assert len(tree_indices) == len(td)
         self.priority_calls += 1
 
-    def insert(self, feat, action_idxs, reward, next_feat, done):
+    def insert(self, feat, action_idxs, reward, next_feat, done, discount=None):
         self.inserted.append(
-            (np.asarray(feat), np.asarray(action_idxs), reward, np.asarray(next_feat), done)
+            (
+                np.asarray(feat),
+                np.asarray(action_idxs),
+                reward,
+                np.asarray(next_feat),
+                done,
+                discount,
+            )
         )
 
 
@@ -116,14 +123,112 @@ def test_forced_terminal_flushes_partial_episode_without_success_reward():
     assert summary == {
         "task_success": False,
         "reward_success": False,
+        "speed_violation": False,
         "length": 2,
         "exec_time_s": 0.5,
         "dense_steps": 30,
+        "execution_steps": 2,
         "truncated": True,
     }
     assert [row[2] for row in buffer.inserted] == [0.0, 0.0]
     assert [row[4] for row in buffer.inserted] == [False, True]
     np.testing.assert_array_equal(buffer.inserted[0][3], np.asarray([1.0]))
+
+
+def test_paper_speedtuning_reward_uses_execution_step_discount():
+    pending = [
+        {
+            "feat": np.asarray([0.0]),
+            "action_idxs": np.asarray([0]),
+            "v_list": [4.0],
+            "r_task": 1.0,
+            "done": True,
+            "duration": 0.2,
+            "n_exec": 30,
+            "execution_steps": 3,
+        }
+    ]
+    buffer = FakeBuffer()
+
+    summary = flush_pending_episode(
+        pending,
+        buffer,
+        FakeBackend(),
+        task_success=True,
+        speed_violation=True,
+        reward_mode="paper_speedtuning",
+        reward_alpha=0.1,
+        reward_beta=2.0,
+        gamma=0.5,
+    )
+
+    expected_reward = 0.1 * 16.0 * (1.0 + 0.5 + 0.25) + 0.25
+    assert abs(buffer.inserted[0][2] - expected_reward) < 1e-6
+    assert abs(buffer.inserted[0][5] - 0.125) < 1e-9
+    assert summary["reward_success"] is True
+    assert summary["speed_violation"] is True
+    assert summary["execution_steps"] == 3
+
+
+def test_paper_speedtuning_failure_keeps_speed_reward_without_penalty():
+    pending = [
+        {
+            "feat": np.asarray([0.0]),
+            "action_idxs": np.asarray([0]),
+            "v_list": [4.0],
+            "r_task": 0.0,
+            "done": True,
+            "duration": 0.2,
+            "n_exec": 30,
+            "execution_steps": 2,
+        }
+    ]
+    buffer = FakeBuffer()
+
+    summary = flush_pending_episode(
+        pending,
+        buffer,
+        FakeBackend(),
+        task_success=False,
+        speed_violation=False,
+        reward_mode="paper_speedtuning",
+        reward_alpha=0.1,
+        reward_beta=2.0,
+        gamma=0.5,
+    )
+
+    assert abs(buffer.inserted[0][2] - 2.4) < 1e-6
+    assert summary["reward_success"] is False
+
+
+def test_success_gated_reward_uses_execution_step_discount():
+    pending = [
+        {
+            "feat": np.asarray([0.0]),
+            "action_idxs": np.asarray([0]),
+            "v_list": [4.0],
+            "r_task": 1.0,
+            "done": True,
+            "duration": 0.2,
+            "n_exec": 30,
+            "execution_steps": 4,
+        }
+    ]
+    buffer = FakeBuffer()
+
+    summary = flush_pending_episode(
+        pending,
+        buffer,
+        FakeBackend(),
+        task_success=True,
+        speed_violation=False,
+        reward_mode="success_gated",
+        gamma=0.5,
+    )
+
+    assert buffer.inserted[0][2] == 16.0
+    assert abs(buffer.inserted[0][5] - 0.0625) < 1e-9
+    assert summary["reward_success"] is True
 
 
 def test_sync_entry_uses_environment_decision_budget_and_partial_flush():
@@ -132,6 +237,11 @@ def test_sync_entry_uses_environment_decision_budget_and_partial_flush():
     assert source.count("env.step_chunk(") == 1
     assert "run_episode_updates(" in source
     assert "force_terminal=True" in source
+    assert "\"execution_steps\"" in source
+    assert "ep_speed_violations" in source
+    assert "\"rollout/speed_violation_rate\"" in source
+    assert "reward_mode=str(config.get(\"reward_mode\", \"success_gated\"))" in source
+    assert "gamma=float(config.gamma)" in source
 
 
 def test_async_entry_uses_counted_episode_queue_instead_of_event_latch():
@@ -142,6 +252,11 @@ def test_async_entry_uses_counted_episode_queue_instead_of_event_latch():
     assert "_new_episode = threading.Event()" not in source
     assert "_worker_error = [None]" in source
     assert "SpeedTune async update worker failed" in source
+    assert "\"execution_steps\"" in source
+    assert "ep_speed_violations" in source
+    assert "\"rollout/speed_violation_rate\"" in source
+    assert "reward_mode=str(config.get(\"reward_mode\", \"success_gated\"))" in source
+    assert "gamma=float(config.gamma)" in source
 
 
 def main():

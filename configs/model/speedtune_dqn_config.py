@@ -75,7 +75,7 @@ def get_config():
     # --- 探索（epsilon-greedy，每 head 独立）---
     config.epsilon_start = 1.0
     config.epsilon_end = 0.05
-    config.epsilon_decay_steps = 20000   # 决策步数
+    config.epsilon_decay_steps = 4000    # 决策步数；实机/仿真小样本实验不宜 20k 慢退火
 
     # --- 单速度head课程（fixed_time / chunk_toppra）---
     config.curriculum_enabled = True
@@ -94,9 +94,14 @@ def get_config():
     config.target_update_period = 1      # 软更新每步做；>1 时改周期硬更新（train 脚本支持）
 
     # --- reward 统一覆盖钮（None=用 exec_backends 各变量默认 α/β）---
-    # 细调单个变量请改 exec_backends._default_specs；这里是一键统一缩放。
+    # success_gated: 现有防 reward hacking reward，失败 episode 速度项为 0。
+    # paper_speedtuning: 复现 SpeedTuning 论文 r=α*v^β+r_task，速度项不 success-gated。
+    config.reward_mode = "success_gated"
     config.reward_alpha = 1.0
     config.reward_beta = 2.0
+    # Paper mode 的 C51 support 动态估计用高层 action step 数，不用物理仿真 dense step。
+    config.paper_speedtuning_episode_steps = 800
+    config.paper_speedtuning_task_reward_max = 1.0
 
     # --- 杂项 ---
     # 终止预算对齐 train_pi_robo 的环境交互步：一次 step = 一次 VLA+DQN 决策和 env.step_chunk；

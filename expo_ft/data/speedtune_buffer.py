@@ -1,10 +1,10 @@
 """SpeedTune DQN 经验回放（n-step 聚合 + 比例 PER / sum-tree）。
 
-存的是 transition 而非图像：``(feat, action_idxs, reward, next_feat, done)``，其中
+存的是 transition 而非图像：``(feat, action_idxs, reward, next_feat, done, discount)``，其中
 ``feat`` 是 mean-pooled 的 detached suffix 特征 ``[feat_dim]``（DQN 的 state），
 ``action_idxs`` 是各 head 的离散档位 ``[n_heads]``。决策粒度 = 一整段 chunk。
 
-  - n-step 聚合：维护长度 n 的滑窗，把 ``(s_t, a_t, Σγᵏr, s_{t+n}, γⁿ·(1-done))`` 写入树；
+  - n-step 聚合：维护长度 n 的滑窗，把 ``(s_t, a_t, ΣΓᵏr, s_{t+n}, Γ·(1-done))`` 写入树；
     episode 结束时 flush 余下的短窗（截断到 done）。
   - 比例 PER（Schaul et al. 2016）：sum-tree 按 ``pᵅ`` 采样，重要度权重 ``(N·P)⁻ᵝ``，
     新样本给当前最大优先级（保证至少被采一次）。
@@ -63,7 +63,9 @@ class _SumTree:
         return idx, float(self.tree[idx]), data_idx
 
 
-_Trans = collections.namedtuple("_Trans", "feat action_idxs reward next_feat done")
+_Trans = collections.namedtuple(
+    "_Trans", "feat action_idxs reward next_feat done discount"
+)
 
 
 class SpeedTuneReplayBuffer:
@@ -119,11 +121,11 @@ class SpeedTuneReplayBuffer:
         done_flag = 0.0
         for t in q:
             R += discount * float(t.reward)
-            discount *= self.gamma
+            last_next_feat = t.next_feat
             if t.done:
-                last_next_feat = t.next_feat
                 done_flag = 1.0
                 break
+            discount *= float(t.discount)
         eff_discount = 0.0 if done_flag > 0.5 else discount  # 终止则不 bootstrap
         first = q[0]
         write = self._tree.write
@@ -135,12 +137,30 @@ class SpeedTuneReplayBuffer:
         self._done[write] = done_flag
         self._tree.add(self._max_priority ** self.per_alpha)
 
-    def insert(self, feat, action_idxs, reward: float, next_feat, done: bool) -> None:
+    def insert(
+        self,
+        feat,
+        action_idxs,
+        reward: float,
+        next_feat,
+        done: bool,
+        discount: float = None,
+    ) -> None:
         """加入一步 transition；n-step 窗满或 episode done 时落盘。"""
         feat = np.asarray(feat, dtype=np.float32).reshape(self.feat_dim)
         next_feat = np.asarray(next_feat, dtype=np.float32).reshape(self.feat_dim)
         action_idxs = np.asarray(action_idxs, dtype=np.int32).reshape(self.n_heads)
-        self._nstep_q.append(_Trans(feat, action_idxs, float(reward), next_feat, bool(done)))
+        transition_discount = self.gamma if discount is None else float(discount)
+        self._nstep_q.append(
+            _Trans(
+                feat,
+                action_idxs,
+                float(reward),
+                next_feat,
+                bool(done),
+                transition_discount,
+            )
+        )
         if done:
             # episode 结束：flush 整个窗，每条都作为起点聚合一次（到 done 截断），清空。
             while self._nstep_q:

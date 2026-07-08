@@ -26,6 +26,7 @@ CHUNK_TOPPRA_K_SKIP="${CHUNK_TOPPRA_K_SKIP:-40}"
 N_EPISODES="${N_EPISODES:-30}"
 VIDEO_EPISODES="${VIDEO_EPISODES:-5}"
 MAX_DECISION_STEPS="${MAX_DECISION_STEPS:-400}"
+CONFIG_OVERRIDES="${CONFIG_OVERRIDES:-}"
 DRY_RUN="${DRY_RUN:-0}"
 CLEANUP_SELF_TEST="${CLEANUP_SELF_TEST:-0}"
 COMPARE_GPU="${COMPARE_GPU:-1}"
@@ -80,6 +81,10 @@ PORTS=("${PORTS[@]:0:${#BACKENDS[@]}}")
 SERVER_GPUS=("${SERVER_GPUS[@]:0:${#BACKENDS[@]}}")
 TRAIN_GPUS=("${TRAIN_GPUS[@]:0:${#BACKENDS[@]}}")
 read -ra PYTHON_CMD <<< "$PYTHON"
+CONFIG_OVERRIDE_ARGS=()
+if [ -n "$CONFIG_OVERRIDES" ]; then
+  read -ra CONFIG_OVERRIDE_ARGS <<< "$CONFIG_OVERRIDES"
+fi
 
 require_path() {
   local path="$1" label="$2"
@@ -147,6 +152,7 @@ if [ "$DRY_RUN" = "1" ]; then
   echo "[DRY-RUN] stream_hold_steps: $STREAM_HOLD_STEPS"
   echo "[DRY-RUN] chunk_toppra_k_skip: $CHUNK_TOPPRA_K_SKIP"
   echo "[DRY-RUN] max_decision_steps: $MAX_DECISION_STEPS"
+  echo "[DRY-RUN] config_overrides: ${CONFIG_OVERRIDES:-<none>}"
   echo "[DRY-RUN] train_mode: $TRAIN_MODE"
   echo "[DRY-RUN] trainer: $TRAIN_ENTRY"
   echo "[DRY-RUN] expo_commit: $EXPO_COMMIT"
@@ -247,6 +253,7 @@ for i in "${!BACKENDS[@]}"; do
   setsid env CUDA_VISIBLE_DEVICES="$gpu" XLA_PYTHON_CLIENT_MEM_FRACTION="$TRAIN_MEM_FRAC" \
     WANDB_PROJECT="$WANDB_PROJECT" "${PYTHON_CMD[@]}" "$TRAIN_ENTRY" \
       --config "$MODEL_CONFIG" --config.exec_backend "$be" --config.max_iters "$MAX_ITERS" \
+      "${CONFIG_OVERRIDE_ARGS[@]}" \
       --config.stream_hold_steps "$STREAM_HOLD_STEPS" \
       --config.chunk_toppra_k_skip "$CHUNK_TOPPRA_K_SKIP" --config_task "$TASK_CONFIG" \
       --client_host localhost --client_port "$port" --seed "$SEED" \
@@ -275,6 +282,7 @@ EVAL_LOG="$OUTPUT_DIR/eval.log"
 if [ "${#BACKENDS[@]}" -eq 2 ]; then
   setsid env CUDA_VISIBLE_DEVICES="$COMPARE_GPU" XLA_PYTHON_CLIENT_MEM_FRACTION="$COMPARE_MEM_FRAC" \
     "${PYTHON_CMD[@]}" eval_speedtune_compare.py --config "$MODEL_CONFIG" --config_task "$TASK_CONFIG" \
+      "${CONFIG_OVERRIDE_ARGS[@]}" \
       --config.stream_hold_steps "$STREAM_HOLD_STEPS" \
       --config.chunk_toppra_k_skip "$CHUNK_TOPPRA_K_SKIP" \
       --backend_a "${BACKENDS[0]}" --ckpt_a "${CKPTS[0]}" --port_a "${PORTS[0]}" \
@@ -286,6 +294,7 @@ else
   setsid env CUDA_VISIBLE_DEVICES="$COMPARE_GPU" XLA_PYTHON_CLIENT_MEM_FRACTION="$COMPARE_MEM_FRAC" \
     "${PYTHON_CMD[@]}" eval_speedtune.py --config "$MODEL_CONFIG" \
       --config.exec_backend "${BACKENDS[0]}" --config.stream_hold_steps "$STREAM_HOLD_STEPS" \
+      "${CONFIG_OVERRIDE_ARGS[@]}" \
       --config.chunk_toppra_k_skip "$CHUNK_TOPPRA_K_SKIP" \
       --config_task "$TASK_CONFIG" --dqn_ckpt "${CKPTS[0]}" --client_port "${PORTS[0]}" \
       --n_episodes "$N_EPISODES" --seed "$SEED" --max_decision_steps "$MAX_DECISION_STEPS" \

@@ -13,6 +13,7 @@ grep -q 'CHUNK_TOPPRA_K_SKIP="${CHUNK_TOPPRA_K_SKIP:-40}"' "$SCRIPT"
 grep -q -- '--config.chunk_toppra_k_skip "$CHUNK_TOPPRA_K_SKIP"' "$SCRIPT"
 grep -q -- '--record_video' "$SCRIPT"
 grep -q 'DRY_RUN' "$SCRIPT"
+grep -q 'CONFIG_OVERRIDES' "$SCRIPT"
 grep -q 'CLEANUP_SELF_TEST' "$SCRIPT"
 grep -q 'kill -TERM -- "-\$pid"' "$SCRIPT"
 grep -qx 'cd "$EXPO_ROOT"' "$SCRIPT"
@@ -35,6 +36,7 @@ grep -q 'chunk_toppra_k_skip: 40' <<<"$output"
 grep -q 'max_decision_steps: 400' <<<"$output"
 grep -q 'train_mode: sync' <<<"$output"
 grep -q 'trainer: train_speedtune_sync.py' <<<"$output"
+grep -q 'config_overrides: <none>' <<<"$output"
 grep -q 'video_episodes: 5' <<<"$output"
 grep -q 'expo_commit:' <<<"$output"
 grep -q 'robotwin_commit:' <<<"$output"
@@ -59,6 +61,12 @@ max_iters_override="$(DRY_RUN=1 MAX_ITERS=1234 \
   EXPO_ROOT="$ROOT" ROBOTWIN_ROOT="/home/xukainan/RoboTwin" \
   SPEEDTUNE_VLA_CKPT="$tmp/vla.ckpt" bash "$SCRIPT" 2>&1)"
 grep -q 'max_iters: 1234' <<<"$max_iters_override"
+
+config_override="$(DRY_RUN=1 BACKENDS='fixed_time' \
+  CONFIG_OVERRIDES='--config.reward_mode paper_speedtuning --config.reward_alpha 1e-4 --config.reward_beta 2.0 --config.curriculum_enabled False' \
+  EXPO_ROOT="$ROOT" ROBOTWIN_ROOT="/home/xukainan/RoboTwin" \
+  SPEEDTUNE_VLA_CKPT="$tmp/vla.ckpt" bash "$SCRIPT" 2>&1)"
+grep -q 'config_overrides: --config.reward_mode paper_speedtuning --config.reward_alpha 1e-4 --config.reward_beta 2.0 --config.curriculum_enabled False' <<<"$config_override"
 
 async_mode="$(DRY_RUN=1 TRAIN_MODE=async \
   EXPO_ROOT="$ROOT" ROBOTWIN_ROOT="/home/xukainan/RoboTwin" \

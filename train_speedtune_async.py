@@ -343,7 +343,8 @@ def main(_):
     pending = []          # 当前 episode 的决策步（episode 结束统一回填 reward 再入 buffer）
     ep_success = False
     ep_speed_violation = False
-    ep_returns, ep_reward_returns, ep_lens, ep_exec_time, ep_dense = [], [], [], [], []
+    ep_returns, ep_reward_returns, ep_speed_violations = [], [], []
+    ep_lens, ep_exec_time, ep_dense = [], [], []
     _fallbacks = [0, 0]   # [topp_fallback 次数, 总 chunk 次数] → fallback 率
 
     def _flush_episode(*, force_terminal=False):
@@ -356,9 +357,20 @@ def main(_):
                 pending, buffer, backend, task_success=ep_success,
                 speed_violation=ep_speed_violation,
                 force_terminal=force_terminal,
+                reward_mode=str(config.get("reward_mode", "success_gated")),
+                reward_alpha=(
+                    1.0 if config.get("reward_alpha", None) is None
+                    else float(config.get("reward_alpha", 1.0))
+                ),
+                reward_beta=(
+                    2.0 if config.get("reward_beta", None) is None
+                    else float(config.get("reward_beta", 2.0))
+                ),
+                gamma=float(config.gamma),
             )
         ep_returns.append(summary["task_success"])
         ep_reward_returns.append(summary["reward_success"])
+        ep_speed_violations.append(summary["speed_violation"])
         ep_lens.append(summary["length"])
         ep_exec_time.append(summary["exec_time_s"])
         ep_dense.append(summary["dense_steps"])
@@ -406,12 +418,18 @@ def main(_):
             pending.append(dict(feat=feat, action_idxs=idxs, v_list=v_list,
                                 r_task=float(r_task), done=bool(done),
                                 duration=float(exec_info.get("duration", 0.0)),
-                                n_exec=int(exec_info.get("n_exec_steps", 0))))
+                                n_exec=int(exec_info.get("n_exec_steps", 0)),
+                                execution_steps=int(
+                                    exec_info.get("execution_steps", 1) or 1
+                                )))
 
             # 每 log_every 决策步统一 log（step=it）：action/exec + 最新 training metrics 合并到同一 step。
             if it % log_every == 0:
                 sp_log = {f"action/{k}": float(val) for k, val in speed_params.items()}
                 sp_log["exec/dense_steps"] = int(exec_info.get("n_exec_steps", 0))
+                sp_log["exec/execution_steps"] = int(
+                    exec_info.get("execution_steps", 0)
+                )
                 sp_log["exec/duration_s"] = float(exec_info.get("duration", 0.0))
                 sp_log["exec/planned_cruise_fraction"] = float(
                     exec_info.get("planned_cruise_fraction", 0.0)
@@ -420,6 +438,10 @@ def main(_):
                 sp_log["exec/fixed_time_speed_violation"] = float(
                     bool(exec_info.get("fixed_time_speed_violation", False))
                 )
+                sp_log["exec/topp_torque_constrained"] = float(
+                    bool(exec_info.get("topp_torque_constrained", False))
+                )
+                sp_log["exec/topp_sd_start"] = float(exec_info.get("topp_sd_start", 0.0))
                 if "acc_limit" in exec_info:
                     sp_log["action/derived_acc_limit"] = float(exec_info["acc_limit"])
                 if _train_metrics[0] is not None:
@@ -443,6 +465,7 @@ def main(_):
                     fb_rate = _fallbacks[0] / max(_fallbacks[1], 1)
                     rollout_log = {"rollout/success_rate": float(np.mean(ep_returns[-50:])),
                                "rollout/reward_success_rate": float(np.mean(ep_reward_returns[-50:])),
+                               "rollout/speed_violation_rate": float(np.mean(ep_speed_violations[-50:])),
                                "rollout/ep_len_mean": float(np.mean(ep_lens[-50:])),
                                "rollout/exec_time_s": float(np.mean(ep_exec_time[-50:])),  # 对比核心：成功 vs 执行时间
                                "rollout/dense_steps": float(np.mean(ep_dense[-50:])),

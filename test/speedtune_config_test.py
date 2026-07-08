@@ -12,6 +12,8 @@ def test_speedtune_config_uses_one_hundred_c51_atoms():
     assert config.n_atoms == 100
     assert config.reward_alpha == 1.0
     assert config.reward_beta == 2.0
+    assert config.reward_mode == "success_gated"
+    assert config.paper_speedtuning_episode_steps == 800
 
 
 def test_backend_specific_k_skip_and_support():
@@ -40,6 +42,17 @@ def test_support_covers_finite_horizon_raw_speed_squared_q_range():
     assert chunk_support == (0.0, 550.0)
     assert fixed_support[1] >= fixed_q_max
     assert chunk_support[1] >= chunk_q_max
+
+
+def test_paper_speedtuning_support_scales_with_alpha():
+    config = get_config()
+    config.reward_mode = "paper_speedtuning"
+    config.reward_alpha = 1e-4
+    config.reward_beta = 2.0
+    support = backend_support(config, "fixed_time")
+    expected_max = 1.0 + finite_horizon_q_max(1e-4 * 4.0 ** 2, config.gamma, 800)
+    assert support[0] == 0.0
+    assert abs(support[1] - expected_max) < 1e-9
 
 
 def test_episode_reward_success_gates_task_failure_and_speed_violation():
